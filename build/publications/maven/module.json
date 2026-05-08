@@ -1,0 +1,92 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "com.xaan",
+    "module": "vault-crypto",
+    "version": "0.0.1-SNAPSHOT",
+    "attributes": {
+      "org.gradle.status": "integration"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "8.7"
+    }
+  },
+  "variants": [
+    {
+      "name": "apiElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 17,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-api"
+      },
+      "dependencies": [
+        {
+          "group": "org.springframework.vault",
+          "module": "spring-vault-core",
+          "version": {
+            "requires": "3.1.0"
+          }
+        },
+        {
+          "group": "org.springframework",
+          "module": "spring-context",
+          "version": {
+            "requires": "6.2.0"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "vault-crypto-0.0.1-SNAPSHOT.jar",
+          "url": "vault-crypto-0.0.1-SNAPSHOT.jar",
+          "size": 2984,
+          "sha512": "da3318e219753ef710de4193043cae0cdcfae316d0df2d170b0a7d6f4eaa37e1c283776f79a119c20911df1169f6e048f927f520c953fd21f963907db6f1ae80",
+          "sha256": "67972f81db5ca3b8d4e106d7351e14c0a253fc3ec8c574d5f42bc6bf4993dcf4",
+          "sha1": "5c79296f42e1612e40733eafae81d2399f59d227",
+          "md5": "416e37526ce832ac781223686b25a48f"
+        }
+      ]
+    },
+    {
+      "name": "runtimeElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 17,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime"
+      },
+      "dependencies": [
+        {
+          "group": "org.springframework.vault",
+          "module": "spring-vault-core",
+          "version": {
+            "requires": "3.1.0"
+          }
+        },
+        {
+          "group": "org.springframework",
+          "module": "spring-context",
+          "version": {
+            "requires": "6.2.0"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "vault-crypto-0.0.1-SNAPSHOT.jar",
+          "url": "vault-crypto-0.0.1-SNAPSHOT.jar",
+          "size": 2984,
+          "sha512": "da3318e219753ef710de4193043cae0cdcfae316d0df2d170b0a7d6f4eaa37e1c283776f79a119c20911df1169f6e048f927f520c953fd21f963907db6f1ae80",
+          "sha256": "67972f81db5ca3b8d4e106d7351e14c0a253fc3ec8c574d5f42bc6bf4993dcf4",
+          "sha1": "5c79296f42e1612e40733eafae81d2399f59d227",
+          "md5": "416e37526ce832ac781223686b25a48f"
+        }
+      ]
+    }
+  ]
+}
