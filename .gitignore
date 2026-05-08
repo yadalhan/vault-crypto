@@ -1,0 +1,12 @@
+# Build files
+build/
+.gradle/
+
+# IDE
+.idea/
+*.iml
+.eclipse/
+.vscode/
+
+# Mac
+.DS_Store
