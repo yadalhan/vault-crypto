@@ -22,7 +22,7 @@ export PATH=$JAVA_HOME/bin:$PATH
 ./gradlew clean build publishToMavenLocal
 ```
 
-빌드된 JAR는 `~/.m2/repository/com/xaan/vault-crypto/0.0.1-SNAPSHOT/`에 설치됩니다.
+빌드된 JAR는 `~/.m2/repository/com/xaan/vault-crypto/0.0.1/`에 설치됩니다.
 
 ## 의존성 추가
 
@@ -31,7 +31,7 @@ export PATH=$JAVA_HOME/bin:$PATH
 <dependency>
     <groupId>com.xaan</groupId>
     <artifactId>vault-crypto</artifactId>
-    <version>0.0.1-SNAPSHOT</version>
+    <version>0.0.1</version>
 </dependency>
 ```
 
@@ -43,7 +43,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.xaan:vault-crypto:0.0.1-SNAPSHOT'
+    implementation 'com.xaan:vault-crypto:0.0.1'
 }
 ```
 
@@ -136,6 +136,26 @@ vault-crypto/
 └── settings.gradle
 ```
 
-## 버전 히스토리
+## Release History
 
-- **0.0.1-SNAPSHOT**: 초기 릴리즈 (AES-256 ECB, Vault kv-v2 지원)
+### v0.0.1 (2026-05-08)
+
+**Initial release** - Standalone Vault-based encryption library for Spring Boot applications.
+
+**Features:**
+- Vault kv-v2 backend support (mount: `ebiz_service`, path: `data/ebiz_db/data-enc-key`)
+- AES-256 encryption/decryption (ECB mode, PKCS5 padding)
+- Spring Cloud Vault integration (`VaultOperations`)
+- Base64 encoding/decoding for encrypted values
+- `encrypt(plainText)`, `decrypt(encryptedText)`, `validate(input, storedEncrypted)` methods
+- Configurable Vault secret path (custom mount/path support)
+
+**Security:**
+- Encryption key loaded from HashiCorp Vault at startup
+- Fail-fast disabled to allow graceful degradation when Vault is unavailable
+- Constant-time validation method to prevent timing attacks
+
+**Dependency:**
+```groovy
+implementation 'com.xaan:vault-crypto:0.0.1'
+```
