@@ -4,12 +4,12 @@ Vault 기반 암호화 라이브러리 for Spring Boot applications.
 
 ## 개요
 
-HashiCorp Vault에서 암호화 키를 읽어와 AES-256 ECB 모드로 암호화/복호화를 수행합니다.
+HashiCorp Vault에서 암호화 키를 읽어와 AES-256 GCM 모드로 암호화/복호화를 수행합니다.
 
 ## 기능
 
 - Vault kv-v2 백엔드 지원
-- AES-256 암호화/복호화 (ECB 모드, PKCS5 패딩)
+- AES-256 암호화/복호화 (GCM 모드, 인증 암호화)
 - Spring Cloud Vault 통합
 - Base64 인코딩/디코딩
 
@@ -144,7 +144,7 @@ vault-crypto/
 
 **Features:**
 - Vault kv-v2 backend support (mount: `ebiz_service`, path: `data/ebiz_db/data-enc-key`)
-- AES-256 encryption/decryption (ECB mode, PKCS5 padding)
+- AES-256 encryption/decryption (GCM mode, authenticated encryption)
 - Spring Cloud Vault integration (`VaultOperations`)
 - Base64 encoding/decoding for encrypted values
 - `encrypt(plainText)`, `decrypt(encryptedText)`, `validate(input, storedEncrypted)` methods
