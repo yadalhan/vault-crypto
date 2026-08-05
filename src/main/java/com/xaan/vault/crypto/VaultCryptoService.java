@@ -12,7 +12,6 @@ import java.security.SecureRandom;
 import java.util.Base64;
 import java.util.Map;
 import java.nio.charset.StandardCharsets;
-import java.nio.charset.StandardCharsets;
 
 /**
  * Vault-based encryption/decryption service.
@@ -99,7 +98,7 @@ public class VaultCryptoService {
             
             return Base64.getUrlEncoder().encodeToString(buffer.array());
         } catch (Exception e) {
-            throw new RuntimeException("Error encrypting data", e);
+            throw new CryptoException("Error encrypting data", e);
         }
     }
 
@@ -112,8 +111,9 @@ public class VaultCryptoService {
         try {
             byte[] combined = Base64.getUrlDecoder().decode(encryptedText);
             
-            if (combined.length < GCM_IV_LENGTH_BYTES) {
-                throw new RuntimeException("Encrypted text too short");
+            if (combined.length < GCM_IV_LENGTH_BYTES + GCM_TAG_LENGTH_BITS / 8) {
+                throw new CryptoException("Encrypted text too short: expected at least " +
+                        (GCM_IV_LENGTH_BYTES + GCM_TAG_LENGTH_BITS / 8) + " bytes, got " + combined.length);
             }
             
             ByteBuffer buffer = ByteBuffer.wrap(combined);
@@ -129,8 +129,10 @@ public class VaultCryptoService {
             
             byte[] decryptedBytes = cipher.doFinal(encryptedBytes);
             return new String(decryptedBytes, StandardCharsets.UTF_8);
+        } catch (CryptoException e) {
+            throw e;
         } catch (Exception e) {
-            throw new RuntimeException("Error decrypting data", e);
+            throw new CryptoException("Error decrypting data", e);
         }
     }
 
