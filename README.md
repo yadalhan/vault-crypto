@@ -1,40 +1,43 @@
 # vault-crypto
 
-HashiCorp Vault 기반 AES-256 GCM 암호화 라이브러리 for Spring Boot
+HashiCorp Vault 기반 KEK-DEK 봉투 암호화(Envelope Encryption) 라이브러리 for Spring Boot
 
 ## 개요
 
-`vault-crypto`는 HashiCorp Vault에서 암호화 키를 안전하게 로드하여 AES-256 GCM 모드로 데이터의 암호화/복호화를 수행하는 Spring Boot 라이브러리입니다.
+`vault-crypto`는 HashiCorp Vault에 저장된 KEK(Key Encryption Key)로 서비스 도메인별 DEK(Data Encryption Key)를 wrap/unwrap하고, 각 도메인의 DEK를 메모리에 캐시하여 AES-256 GCM으로 데이터를 암/복호화하는 Spring Boot 라이브러리입니다.
 
 ### 주요 특징
 
-- **Vault 통합**: HashiCorp Vault kv-v2 백엔드에서 암호화 키를 안전하게 로드
+- **KEK-DEK 봉투 암호화**: Vault의 KEK는 데이터를 직접 암호화하지 않고 도메인별 DEK를 wrap하는 용도로만 사용
+- **도메인 격리**: 서비스 도메인(예: `board`, `user-pii`)마다 독립된 DEK를 사용해 한 도메인의 키 유출이 다른 도메인으로 번지지 않음
+- **성능**: DEK는 앱 기동 시 1회 unwrap되어 메모리에 캐시되므로, 이후 암/복호화 호출은 Vault 네트워크 호출 없이 로컬에서 수행됨
+- **키 로테이션 지원**: 암호문에 `domainCode`+`keyVersion` 헤더를 포함해, DEK를 교체한 뒤에도 이전 버전으로 암호화된 데이터를 계속 복호화 가능
 - **AES-256 GCM**: 인증된 암호화(Authenticated Encryption) 지원
 - **Spring 통합**: `VaultOperations`를 통한 Spring Cloud Vault 연동
-- **Base64 URL-safe 인코딩**: 암호화된 데이터를 안전하게 문자열로 저장
 - **커스텀 예외**: `CryptoException`, `KeyLoadingException`으로 세밀한 오류 처리
-- **Timing Attack 방지**: `MessageDigest.isEqual()` 기반 상수 시간 비교
 
 ### 아키텍처
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                      Your Application                        │
-│  (BoardService, UserService, etc.)                           │
-├──────────────────────────────────────────────────────────────┤
-│                    VaultCryptoService                         │
-│  ┌────────────┐  ┌────────────┐  ┌──────────────────────┐   │
-│  │ encrypt()  │  │ decrypt()  │  │ validate()           │   │
-│  │ AES-256    │  │ AES-256    │  │ constant-time compare│   │
-│  │ GCM mode   │  │ GCM mode   │  │                      │   │
-│  └────────────┘  └────────────┘  └──────────────────────┘   │
-├──────────────────────────────────────────────────────────────┤
-│                   Spring Cloud Vault                         │
-│              (VaultOperations / VaultTemplate)                │
-├──────────────────────────────────────────────────────────────┤
-│                  HashiCorp Vault Server                       │
-│               kv-v2: fernet-key (32 bytes)                   │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                          Your Application                             │
+│              (BoardService, UserService, ... 도메인별 서비스)          │
+├──────────────────────────────────────────────────────────────────────┤
+│                       EnvelopeCryptoService (도메인당 1개)             │
+│  ┌────────────┐  ┌────────────┐  ┌──────────────────────┐            │
+│  │ encrypt()  │  │ decrypt()  │  │ validate()            │            │
+│  └────────────┘  └────────────┘  └──────────────────────┘            │
+│                              │                                        │
+│                     DomainKeyRing (unwrap된 DEK를 버전별로 메모리 캐시) │
+├──────────────────────────────────────────────────────────────────────┤
+│      KekService (KEK 보관, wrap/unwrap)   │  DekProvider (wrapped DEK 저장/조회) │
+├──────────────────────────────────────────────────────────────────────┤
+│                        Spring Cloud Vault                             │
+│                    (VaultOperations / VaultTemplate)                  │
+├──────────────────────────────────────────────────────────────────────┤
+│                       HashiCorp Vault Server                          │
+│         kv-v2: kek (마스터 키) + dek/{domain} (wrapped DEK, 버전별)    │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ## 프로젝트 구조
@@ -42,9 +45,17 @@ HashiCorp Vault 기반 AES-256 GCM 암호화 라이브러리 for Spring Boot
 ```
 vault-crypto/
 ├── src/main/java/com/xaan/vault/crypto/
-│   ├── VaultCryptoService.java    # 핵심 암호화/복호화 서비스
-│   ├── CryptoException.java       # 암호화 관련 기본 예외
-│   └── KeyLoadingException.java   # Vault 키 로딩 예외
+│   ├── CryptoException.java              # 암호화 관련 기본 예외
+│   ├── KeyLoadingException.java          # Vault 키 로딩 예외
+│   └── envelope/
+│       ├── AesGcmCodec.java              # 공용 AES-256-GCM 바이트 코덱 (내부용)
+│       ├── KekService.java               # KEK 로드 + DEK wrap/unwrap
+│       ├── WrappedDek.java               # (domain, version, wrappedBytes) 레코드
+│       ├── DekProvider.java              # wrapped DEK 저장소 인터페이스
+│       ├── VaultDekProvider.java         # Vault KV-v2 기반 DekProvider 구현체
+│       ├── DomainKeyRing.java            # 도메인별 unwrap된 DEK 메모리 캐시
+│       ├── EnvelopeCryptoService.java    # 도메인 스코프 encrypt/decrypt/validate
+│       └── DekRotationSupport.java       # DEK 로테이션(신규 버전 발급) 유틸
 ├── build.gradle                   # Gradle 빌드 설정
 ├── settings.gradle                # 프로젝트 설정
 └── README.md
@@ -79,7 +90,7 @@ export PATH=$JAVA_HOME/bin:$PATH
 ./gradlew clean build publishToMavenLocal
 ```
 
-빌드된 JAR는 `~/.m2/repository/com/xaan/vault-crypto/0.0.1/`에 설치됩니다.
+빌드된 JAR는 `~/.m2/repository/com/xaan/vault-crypto/0.0.5/`에 설치됩니다.
 
 ## 의존성 추가
 
@@ -102,7 +113,7 @@ repositories {
 
 dependencies {
     // vault-crypto 라이브러리
-    implementation 'com.xaan:vault-crypto:0.0.1'
+    implementation 'com.xaan:vault-crypto:0.0.5'
 
     // Spring Cloud Vault (필수 의존성)
     implementation 'org.springframework.cloud:spring-cloud-starter-vault-config'
@@ -121,7 +132,7 @@ dependencyManagement {
 <dependency>
     <groupId>com.xaan</groupId>
     <artifactId>vault-crypto</artifactId>
-    <version>0.0.1</version>
+    <version>0.0.5</version>
 </dependency>
 ```
 
@@ -130,26 +141,38 @@ dependencyManagement {
 ### Step 1: Vault kv-v2 백엔드 활성화
 
 ```bash
-# kv-v2 백엔드를 원하는 마운트 경로에 활성화
 vault secrets enable -path=ebiz_service kv-v2
 ```
 
-### Step 2: 암호화 키 저장
+### Step 2: KEK(마스터 키) 저장
 
 ```bash
-# Fernet 키 (32 bytes, Base64URL 인코딩) 저장
-vault kv put -mount=ebiz_service ebiz_db/data-enc-key \
-  fernet-key="NgqOBievnB9500cQOnSQ-cmbBx38KnOiKx5ooQ_e97Y=" \
-  description="encryption key for db column"
+vault kv put -mount=ebiz_service ebiz_db/kek \
+  kek="<Base64URL 인코딩된 32바이트 랜덤 키>"
 ```
 
-### Step 3: 키 저장 확인
+### Step 3: 도메인별 DEK 생성 및 저장 (KEK로 wrap된 상태로 저장)
+
+DEK는 애플리케이션이 임의로 생성해 KEK로 wrap한 뒤 저장해야 하므로, 단순 `vault kv put`만으로는 만들 수 없습니다. 값 계산은 `KekService.wrap(byte[])`를 그대로 쓰거나, 별도 부트스트랩 스크립트로 생성합니다. 저장 형태는 도메인당 시크릿 1개, 버전별 필드:
 
 ```bash
-vault kv get -mount=ebiz_service ebiz_db/data-enc-key
+vault kv put -mount=ebiz_service ebiz_db/dek/board \
+  dek-v1="<Base64URL(IV+ciphertext+tag), KEK로 wrap된 DEK>" \
+  current-version="1"
+
+vault kv put -mount=ebiz_service ebiz_db/dek/user-pii \
+  dek-v1="<Base64URL(IV+ciphertext+tag), KEK로 wrap된 DEK>" \
+  current-version="1"
 ```
 
-### Step 4: Spring Boot application.properties
+### Step 4: 키 저장 확인
+
+```bash
+vault kv get -mount=ebiz_service ebiz_db/kek
+vault kv get -mount=ebiz_service ebiz_db/dek/board
+```
+
+### Step 5: Spring Boot application.properties
 
 ```properties
 # Vault 서버 연결 설정
@@ -157,307 +180,187 @@ spring.cloud.vault.uri=${VAULT_URI:http://192.168.2.57:8200}
 spring.cloud.vault.token=${VAULT_TOKEN:hvs.YOUR_TOKEN_HERE}
 spring.cloud.vault.fail-fast=true
 
-# Vault KV v2 설정
-spring.cloud.vault.kv.enabled=true
-spring.cloud.vault.kv.backend=ebiz_service
-spring.cloud.vault.kv.application-name=ebiz_db/data-enc-key
-spring.cloud.vault.kv.version=2
-
-# vault-crypto에서 사용하는 시크릿 경로 (커스텀 설정)
-vault.secret.path=${VAULT_SECRET_PATH:ebiz_service/data/ebiz_db/data-enc-key}
+# KEK / DEK 경로 (kv-v2이므로 {mount}/data/{path} 형식)
+vault.kek.path=${VAULT_KEK_PATH:ebiz_service/data/ebiz_db/kek}
+vault.dek.base-path=${VAULT_DEK_BASE_PATH:ebiz_service/data/ebiz_db/dek}
 ```
 
-> **참고**: `vault.secret.path`의 경로 형식은 `{mount}/data/{secret-path}`입니다.
-> kv-v2에서 `data`는 Vault API가 자동으로 삽입하는 경로 세그먼트입니다.
+> **참고**: 경로 형식은 `{mount}/data/{secret-path}`입니다. kv-v2에서 `data`는 Vault API가 자동으로 삽입하는 경로 세그먼트입니다.
 
 ## 사용 가이드
 
-### 기본 사용법
+### 기본 사용법 — 도메인별 EnvelopeCryptoService 구성
 
 ```java
-import com.xaan.vault.crypto.VaultCryptoService;
+import com.xaan.vault.crypto.envelope.*;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
 import org.springframework.vault.core.VaultOperations;
-import org.springframework.stereotype.Service;
 
-@Service
-public class MyService {
+@Configuration
+public class CryptoConfig {
 
-    private final VaultCryptoService cryptoService;
-
-    public MyService(VaultOperations vaultOperations) {
-        // 기본 경로 사용: "ebiz_service/data/ebiz_db/data-enc-key"
-        this.cryptoService = new VaultCryptoService(vaultOperations);
+    @Bean
+    public KekService kekService(
+            VaultOperations vaultOperations,
+            @Value("${vault.kek.path}") String kekPath) {
+        return new KekService(vaultOperations, kekPath);
     }
 
-    public void example() {
-        // 암호화
-        String encrypted = cryptoService.encrypt("민감한 데이터");
+    @Bean
+    public DekProvider dekProvider(
+            VaultOperations vaultOperations,
+            @Value("${vault.dek.base-path}") String dekBasePath) {
+        return new VaultDekProvider(vaultOperations, dekBasePath);
+    }
 
-        // 복호화
-        String decrypted = cryptoService.decrypt(encrypted);
+    // 서비스 도메인마다 빈을 하나씩 둔다. domainCode는 도메인마다 고유한 1바이트 값.
+    @Bean
+    public EnvelopeCryptoService boardCryptoService(KekService kek, DekProvider dekProvider) {
+        return EnvelopeCryptoService.forDomain((byte) 1, "board", kek, dekProvider);
+    }
 
-        // 검증 (constant-time comparison)
-        boolean isValid = cryptoService.validate("민감한 데이터", encrypted);
+    @Bean
+    public EnvelopeCryptoService userPiiCryptoService(KekService kek, DekProvider dekProvider) {
+        return EnvelopeCryptoService.forDomain((byte) 2, "user-pii", kek, dekProvider);
     }
 }
 ```
 
-### 커스텀 Vault 경로 사용
+`EnvelopeCryptoService.forDomain(...)`이 호출되는 시점(보통 빈 생성 시, 즉 앱 기동 시)에 KEK로 해당 도메인의 DEK를 1회 unwrap해서 메모리에 캐시합니다. 이후 `encrypt()`/`decrypt()`/`validate()` 호출은 Vault를 다시 호출하지 않습니다.
 
 ```java
 @Service
-public class MyService {
+public class BoardService {
 
-    private final VaultCryptoService cryptoService;
+    private final EnvelopeCryptoService boardCryptoService;
 
-    public MyService(
-            VaultOperations vaultOperations,
-            @Value("${vault.secret.path:ebiz_service/data/ebiz_db/data-enc-key}") String vaultPath) {
-        // application.properties에서 경로를 읽어 주입
-        this.cryptoService = new VaultCryptoService(vaultOperations, vaultPath);
+    public BoardService(@Qualifier("boardCryptoService") EnvelopeCryptoService boardCryptoService) {
+        this.boardCryptoService = boardCryptoService;
+    }
+
+    public String example(String password) {
+        String encrypted = boardCryptoService.encrypt(password);
+        String decrypted = boardCryptoService.decrypt(encrypted);
+        boolean matches = boardCryptoService.validate(password, encrypted);
+        return encrypted;
     }
 }
 ```
 
 ---
 
-### 실전 예제 1: 게시판 비밀번호 암호화 (양방향)
-
-게시글에 비밀번호를 설정하여, 수정/삭제 시 복호화하여 검증하는 패턴입니다.
-
-#### PasswordService.java — 암호화 서비스 래퍼
+### 실전 예제: 게시판 비밀번호 + 개인정보를 별도 도메인으로 분리
 
 ```java
 @Service
 public class PasswordService {
 
-    private final VaultCryptoService vaultCryptoService;
+    private final EnvelopeCryptoService boardCryptoService;
+    private final EnvelopeCryptoService userPiiCryptoService;
 
     public PasswordService(
-            VaultOperations vaultOperations,
-            @Value("${vault.secret.path:ebiz_service/data/ebiz_db/data-enc-key}") String vaultSecretPath) {
-        this.vaultCryptoService = new VaultCryptoService(vaultOperations, vaultSecretPath);
+            @Qualifier("boardCryptoService") EnvelopeCryptoService boardCryptoService,
+            @Qualifier("userPiiCryptoService") EnvelopeCryptoService userPiiCryptoService) {
+        this.boardCryptoService = boardCryptoService;
+        this.userPiiCryptoService = userPiiCryptoService;
     }
 
-    /** 게시글 비밀번호 암호화 (AES-GCM) */
+    // 게시글 비밀번호 (board 도메인 DEK)
     public String encryptBoardPassword(String password) {
-        return vaultCryptoService.encrypt(password);
+        return boardCryptoService.encrypt(password);
     }
 
-    /** 게시글 비밀번호 복호화 */
-    public String decryptBoardPassword(String encryptedPassword) {
-        return vaultCryptoService.decrypt(encryptedPassword);
-    }
-
-    /** 게시글 비밀번호 검증 (constant-time) */
     public boolean validateBoardPassword(String rawPassword, String encryptedPassword) {
-        return vaultCryptoService.validate(rawPassword, encryptedPassword);
+        return boardCryptoService.validate(rawPassword, encryptedPassword);
+    }
+
+    // 주민등록번호 등 개인정보 (user-pii 도메인 DEK — board와 별도 키)
+    public String encryptUserPii(String plainText) {
+        return userPiiCryptoService.encrypt(plainText);
+    }
+
+    public String decryptUserPii(String encryptedText) {
+        return userPiiCryptoService.decrypt(encryptedText);
     }
 }
 ```
 
-#### BoardService.java — 게시글 저장/수정 시 암호화 적용
+`board` DEK로 암호화한 값은 `user-pii` 서비스로 복호화를 시도하면 `domainCode` 불일치로 항상 `CryptoException`이 발생합니다 — 도메인 간 키가 섞이지 않는다는 것을 애플리케이션 레벨에서도 보장합니다.
+
+---
+
+### DEK 로테이션
 
 ```java
-@RequiredArgsConstructor
 @Service
-public class BoardService {
-    private final BoardRepository boardRepository;
-    private final PasswordService passwordService;
+public class KeyRotationAdminService {
 
-    // 게시글 저장 — 비밀번호를 암호화하여 DB에 저장
-    @Transactional
-    public Long save(BoardSaveRequestDto requestDto) {
-        Board board = requestDto.toEntity();
-        if (board.getPassword() != null && !board.getPassword().isEmpty()) {
-            board.updatePassword(
-                passwordService.encryptBoardPassword(board.getPassword())
-            );
-        }
-        return boardRepository.save(board).getId();
+    private final DekRotationSupport rotationSupport;
+
+    public KeyRotationAdminService(KekService kek, DekProvider dekProvider) {
+        this.rotationSupport = new DekRotationSupport(kek, dekProvider);
     }
 
-    // 게시글 수정 — 수정 시에도 비밀번호 재암호화
-    @Transactional
-    public Long update(Long id, BoardUpdateRequestDto requestDto) {
-        Board board = boardRepository.findById(id)
-                .orElseThrow(() -> new IllegalArgumentException("no article for id=" + id));
-        board.update(requestDto.getTitle(), requestDto.getContent());
-        if (requestDto.getPassword() != null && !requestDto.getPassword().isEmpty()) {
-            board.updatePassword(
-                passwordService.encryptBoardPassword(requestDto.getPassword())
-            );
-        }
-        return id;
-    }
-
-    // 게시글 비밀번호 검증
-    public boolean verifyPassword(Long id, String password) {
-        Board board = boardRepository.findById(id)
-                .orElseThrow(() -> new IllegalArgumentException("no article for id=" + id));
-        return passwordService.validateBoardPassword(password, board.getPassword());
+    public int rotateBoardDek() {
+        return rotationSupport.rotate("board"); // 새 버전 번호를 반환
     }
 }
 ```
 
-#### REST API 호출 예시
-
-```bash
-# 비밀번호가 포함된 게시글 생성
-curl -X POST http://localhost:8080/api/v1/posts \
-  -H "Content-Type: application/json" \
-  -d '{"title":"보안 게시글","content":"비밀 내용입니다","password":"mySecret123"}'
-# Returns: 2017588
-
-# DB 확인 — 비밀번호가 Base64 암호화 문자열로 저장됨
-# SELECT password FROM ebiz.board WHERE id = 2017588;
-# → JrwIlNN9YVMIxpqWvYhlNGfd7CUf1wjOgXAHLRIf0io=
-```
-
----
-
-### 실전 예제 2: 개인정보(주민등록번호) 암호화
-
-양방향 암호화가 필요한 개인정보 필드에 적용하는 패턴입니다.
-
-#### UserService.java — 회원가입 시 개인정보 암호화
-
-```java
-@RequiredArgsConstructor
-@Service
-public class UserService {
-    private final UserRepository userRepository;
-    private final PasswordService passwordService;
-
-    @Transactional
-    public Long register(UserRegisterRequestDto dto) {
-        // 입력값 검증 (생략)
-
-        // 사용자 로그인 비밀번호 → BCrypt 단방향 해시 (별도 처리)
-        String hashedPassword = passwordService.hashUserPassword(dto.getPassword());
-
-        // 주민등록번호 → AES-GCM 양방향 암호화 (vault-crypto 사용)
-        String encryptedRRN = passwordService.encryptBoardPassword(
-            dto.getResidentRegistrationNumber()
-        );
-
-        User user = User.builder()
-                .userId(dto.getUserId())
-                .password(hashedPassword)               // BCrypt 해시
-                .username(dto.getUsername())
-                .residentRegistrationNumber(encryptedRRN) // AES-GCM 암호화
-                .build();
-
-        return userRepository.save(user).getId();
-    }
-}
-```
-
-> **설계 포인트**: 사용자 로그인 비밀번호는 BCrypt(단방향)를 사용하고,
-> 주민등록번호처럼 복호화가 필요한 데이터는 vault-crypto(AES-GCM, 양방향)를 사용합니다.
-
----
-
-### 실전 예제 3: Python에서 동일 키로 복호화 (검증용)
-
-Java와 동일한 방식으로 Python에서 암호화된 데이터를 복호화할 수 있습니다.
-
-```python
-import hvac
-import base64
-from Crypto.Cipher import AES
-
-# 1. Vault에서 키 로드
-client = hvac.Client(url='http://192.168.2.57:8200', token='hvs.YOUR_TOKEN')
-secret = client.secrets.kv.v2.read_secret_version(
-    path='ebiz_db/data-enc-key', mount_point='ebiz_service'
-)
-fernet_key = base64.urlsafe_b64decode(secret['data']['data']['fernet-key'])
-
-# 2. 복호화 (Java VaultCryptoService와 동일한 형식)
-def decrypt(encrypted_base64, key):
-    combined = base64.urlsafe_b64decode(encrypted_base64)
-    iv = combined[:12]          # 12 bytes IV
-    ciphertext_with_tag = combined[12:]
-    tag = ciphertext_with_tag[-16:]       # 마지막 16 bytes = GCM auth tag
-    ciphertext = ciphertext_with_tag[:-16]
-    cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
-    return cipher.decrypt_and_verify(ciphertext, tag).decode('utf-8')
-
-# 3. 사용
-decrypted = decrypt("JrwIlNN9YVMIxpqWvYhl...", fernet_key)
-print(f"Decrypted: {decrypted}")
-```
-
-**Python 의존성:**
-```bash
-pip install pycryptodome hvac
-```
-
----
+`rotate()`는 새 DEK를 생성해 KEK로 wrap한 뒤 새 버전으로 저장하고 "current"로 지정합니다. 이전 버전은 `DekProvider`에 그대로 남아 있으므로, 다음 앱 재기동 시 `DomainKeyRing`이 신규/기존 버전을 모두 로드해 과거에 암호화된 데이터도 계속 복호화할 수 있습니다.
 
 ## API 문서
 
-### VaultCryptoService
+### KekService
 
-#### 생성자
-
-| 생성자 | 설명 |
+| 생성자/메서드 | 설명 |
 |--------|------|
-| `VaultCryptoService(VaultOperations)` | 기본 Vault 경로 사용 (`ebiz_service/data/ebiz_db/data-enc-key`) |
-| `VaultCryptoService(VaultOperations, String)` | 커스텀 Vault 경로 지정 |
+| `KekService(VaultOperations, String kekSecretPath)` | Vault에서 KEK를 로드 |
+| `KekService(byte[] rawKekBytes)` | 테스트 등 Vault를 거치지 않는 경우용 |
+| `wrap(byte[] plaintextDek)` | DEK를 KEK로 감싸 저장용 바이트로 변환 |
+| `unwrap(byte[] wrappedDek)` | 저장된 wrapped DEK를 평문으로 복원 |
 
-생성자 호출 시점에 Vault에서 키를 로드합니다. 키 로드 실패 시 `KeyLoadingException`이 발생합니다.
+### EnvelopeCryptoService
 
-#### 메서드
+| 메서드 | 파라미터 | 반환 | 설명 |
+|--------|----------|------|------|
+| `static forDomain(byte domainCode, String domain, KekService, DekProvider)` | - | `EnvelopeCryptoService` | 도메인의 모든 DEK 버전을 unwrap해 메모리 캐시를 구성 |
+| `encrypt(String plainText)` | 평문 | Base64 URL-safe 문자열 | 현재 버전 DEK로 AES-256 GCM 암호화 |
+| `decrypt(String encryptedText)` | 암호문 | 평문 | 헤더의 버전에 맞는 DEK로 복호화. 도메인/버전 불일치 시 `CryptoException` |
+| `validate(String input, String storedEncrypted)` | 평문, 저장된 암호문 | `boolean` | 상수 시간 비교로 Timing Attack 방지, 복호화 실패 시 `false` |
 
-| 메서드 | 파라미터 | 반환 | 예외 | 설명 |
-|--------|----------|------|------|------|
-| `encrypt(String plainText)` | 암호화할 평문 | Base64 URL-safe 문자열 | `CryptoException` | AES-256 GCM 암호화. 매 호출 시 랜덤 IV 생성 |
-| `decrypt(String encryptedText)` | Base64 URL-safe 암호화 문자열 | 복호화된 평문 | `CryptoException` | AES-256 GCM 복호화 |
-| `validate(String input, String storedEncrypted)` | 평문, 저장된 암호화값 | `boolean` | 없음 (내부 처리) | 상수 시간 비교로 Timing Attack 방지 |
-
-#### 암호화 데이터 형식
+### 암호화 데이터 형식
 
 ```
-Base64URL( IV(12 bytes) + Ciphertext(N bytes) + GCM Auth Tag(16 bytes) )
+Base64URL( domainCode(1B) | keyVersion(1B) | IV(12B) | Ciphertext(N bytes) | GCM Auth Tag(16 bytes) )
 ```
 
+- **domainCode**: 도메인마다 고유한 1바이트 값 — 다른 도메인 DEK로 복호화를 시도하면 즉시 실패
+- **keyVersion**: DEK 로테이션 후에도 과거 버전으로 암호화된 데이터를 계속 복호화하기 위한 버전 정보
 - **IV**: 12 bytes (96 bits) — 매 암호화 시 `SecureRandom`으로 생성
-- **Ciphertext**: 평문 길이와 동일
 - **GCM Auth Tag**: 16 bytes (128 bits) — 데이터 무결성 검증
 
 ### 예외 클래스
 
 | 예외 | 부모 클래스 | 발생 시점 |
 |------|-------------|-----------|
-| `CryptoException` | `RuntimeException` | 암호화/복호화 실패 시 |
-| `KeyLoadingException` | `CryptoException` | Vault 키 로딩 실패 시 |
-
-#### 예외 처리 예시
-
-```java
-try {
-    String encrypted = cryptoService.encrypt(sensitiveData);
-} catch (KeyLoadingException e) {
-    // Vault 연결 실패 또는 키를 찾을 수 없음
-    log.error("Vault 키 로딩 실패: {}", e.getMessage());
-} catch (CryptoException e) {
-    // 암호화 처리 중 오류
-    log.error("암호화 실패: {}", e.getMessage());
-}
-```
+| `CryptoException` | `RuntimeException` | 암호화/복호화 실패, 도메인/버전 불일치 시 |
+| `KeyLoadingException` | `CryptoException` | Vault에서 KEK/DEK 로딩 실패 시 |
 
 ## 보안 고려사항
 
 | 항목 | 설명 |
 |------|------|
-| **키 관리** | 암호화 키는 소스 코드에 하드코딩하지 않고 Vault에서 런타임에 로드 |
+| **키 계층 분리** | KEK는 Vault에만 존재하며 데이터를 직접 암호화하지 않음 — DEK를 wrap하는 용도로만 사용 |
+| **도메인 격리** | 서비스 도메인마다 독립된 DEK를 사용해 한 도메인의 키 유출이 다른 도메인 데이터로 번지지 않음 |
+| **키 관리** | KEK/wrapped DEK 모두 소스 코드에 하드코딩하지 않고 Vault에서 런타임에 로드 |
 | **Vault Token** | 환경변수 `VAULT_TOKEN`으로 관리. 소스/설정 파일에 커밋 금지 |
 | **GCM 모드** | 매 암호화 시 랜덤 IV를 생성하므로 동일 평문도 다른 암호문 생성 |
 | **인증 암호화** | GCM 모드의 Auth Tag로 데이터 변조 탐지 |
 | **Timing Attack 방지** | `validate()` 메서드는 `MessageDigest.isEqual()`로 상수 시간 비교 |
-| **Base64URL** | Fernet 키는 URL-safe Base64 인코딩 (`-`, `_` 사용) |
+| **키 로테이션** | 암호문에 포함된 `keyVersion`으로 DEK 교체 후에도 과거 데이터 복호화 가능 |
 | **Fail-fast** | `spring.cloud.vault.fail-fast=true` 설정 시 Vault 미연결 시 앱 시작 차단 |
 
 ## Troubleshooting
@@ -465,7 +368,7 @@ try {
 ### Vault 연결 실패
 
 ```
-KeyLoadingException: Failed to load encryption key from Vault
+KeyLoadingException: Failed to load KEK from Vault
 ```
 
 **확인 사항:**
@@ -474,45 +377,53 @@ KeyLoadingException: Failed to load encryption key from Vault
 3. `VAULT_TOKEN` 환경변수 설정 확인
 4. Vault 토큰 만료 여부 확인: `vault token lookup`
 
-### 키를 찾을 수 없음
+### DEK를 찾을 수 없음
 
 ```
-KeyLoadingException: No 'data' field in Vault response
+KeyLoadingException: No DEK versions found for domain '...' at ...
 ```
 
 **확인 사항:**
-1. kv-v2 마운트가 활성화되어 있는지 확인: `vault secrets list`
-2. 시크릿 경로가 올바른지 확인: `vault kv get -mount=ebiz_service ebiz_db/data-enc-key`
-3. `vault.secret.path`에 `/data/` 세그먼트가 포함되어 있는지 확인 (kv-v2 필수)
+1. `vault.dek.base-path` 아래 `{domain}` 시크릿이 실제로 존재하는지: `vault kv get -mount=ebiz_service ebiz_db/dek/board`
+2. 시크릿에 `dek-v1`, `current-version` 필드가 모두 있는지
+3. `current-version`이 가리키는 버전의 `dek-v{n}` 필드가 실제로 존재하는지
 
 ### 복호화 실패
 
 ```
-CryptoException: Error decrypting data
+CryptoException: Envelope domain mismatch: expected ... but got ...
 ```
 
 **가능한 원인:**
-- 암호화 시 사용한 키와 복호화 시 사용하는 키가 다름
-- 암호화된 데이터가 손상됨 (DB 저장/조회 과정에서 인코딩 변환)
-- Base64 URL-safe와 표준 Base64 혼용
-
-### `@Service` 자동 등록 관련
-
-`vault-crypto`의 `VaultCryptoService`에는 `@Service`가 붙어 있지만, 생성자에 `VaultOperations` 인자가 필요합니다. 소비 프로젝트에서 `VaultOperations` Bean이 등록되어 있으면 Spring이 자동 주입합니다. 커스텀 경로가 필요한 경우에는 직접 Bean을 정의하세요:
-
-```java
-@Configuration
-public class CryptoConfig {
-    @Bean
-    public VaultCryptoService vaultCryptoService(
-            VaultOperations vaultOperations,
-            @Value("${vault.secret.path}") String path) {
-        return new VaultCryptoService(vaultOperations, path);
-    }
-}
-```
+- 다른 도메인의 `EnvelopeCryptoService`로 복호화를 시도함
+- 암호문이 이 라이브러리의 봉투 포맷이 아님(예: 다른 방식으로 암호화된 값)
 
 ## Release History
+
+### v0.0.5 (2026-08-19)
+
+**버전 정렬** — 기능 변경 없음. demoApp이 `0.0.4 → 0.0.5`로 버전을 올리는 데 맞춰, vault-crypto도 `0.0.3 → 0.0.5`로 올려 두 프로젝트의 버전 번호를 통일했다(`0.0.4`는 건너뜀).
+
+### v0.0.3 (2026-08-19)
+
+**Breaking change** — `VaultCryptoService`(단일 키 방식)를 완전히 제거했습니다. 이 클래스를 사용하던 기존 소비 프로젝트는 더 이상 지원하지 않기로 결정했습니다.
+
+**Changes:**
+- `VaultCryptoService.java` 삭제 (v0.0.2에서 `@Deprecated`로 표시했던 클래스)
+- README를 KEK-DEK 봉투 암호화(`EnvelopeCryptoService`) 중심으로 재작성
+
+**Migration**: v0.0.2 이하에서 `VaultCryptoService`를 쓰던 코드는 [사용 가이드](#사용-가이드)를 참고해 `KekService` + `DekProvider` + `EnvelopeCryptoService.forDomain(...)` 조합으로 옮겨야 합니다. 기존 단일 키로 암호화된 데이터는 새 봉투 포맷과 호환되지 않으므로 별도 재암호화가 필요합니다.
+
+### v0.0.2 (2026-08-19)
+
+**KEK-DEK 봉투 암호화 추가** — `com.xaan.vault.crypto.envelope` 패키지 신설.
+
+**Features:**
+- `KekService`: Vault에서 KEK를 로드하고 DEK를 wrap/unwrap
+- `WrappedDek`, `DekProvider`/`VaultDekProvider`: 도메인별 wrapped DEK를 Vault KV-v2에 버전별로 저장/조회
+- `DomainKeyRing`: 도메인별 unwrap된 DEK를 메모리에 캐시 (버전별)
+- `EnvelopeCryptoService`: 도메인 스코프 encrypt/decrypt/validate, `domainCode`+`keyVersion` 헤더로 도메인 격리와 키 로테이션 지원
+- `DekRotationSupport`: DEK 로테이션(신규 버전 발급) 유틸
 
 ### v0.0.1 patch (2026-05-18)
 
@@ -524,32 +435,9 @@ public class CryptoConfig {
 - `decrypt()` 입력 검증 강화: 최소 길이 체크를 IV(12 bytes) → IV + TAG(28 bytes)로 변경
 - `decrypt()` 에서 `CryptoException` re-throw 처리 추가
 
-**Compatibility:** 바이너리 형식 변경 없음. 기존 암호화 데이터와 100% 호환.
-
-**Verified:** demoApp에서 vault-crypto 라이브러리 재통합 후 프로덕션 배포 및 테스트 완료.
-
 ### v0.0.1 (2026-05-08)
 
-**Initial release** — Standalone Vault-based encryption library for Spring Boot applications.
-
-**Features:**
-- Vault kv-v2 backend support (mount: `ebiz_service`, path: `data/ebiz_db/data-enc-key`)
-- AES-256 encryption/decryption (GCM mode, authenticated encryption)
-- Spring Cloud Vault integration (`VaultOperations`)
-- Base64 URL-safe encoding/decoding for encrypted values
-- `encrypt()`, `decrypt()`, `validate()` methods
-- Configurable Vault secret path (custom mount/path support)
-- Custom exception hierarchy: `CryptoException`, `KeyLoadingException`
-
-**Security:**
-- Encryption key loaded from HashiCorp Vault at startup
-- Random IV per encryption for semantic security
-- Constant-time validation to prevent timing attacks
-
-**Dependency:**
-```groovy
-implementation 'com.xaan:vault-crypto:0.0.1'
-```
+**Initial release** — Standalone Vault-based encryption library for Spring Boot applications (단일 키 방식, v0.0.3에서 제거됨).
 
 ## 라이선스
 

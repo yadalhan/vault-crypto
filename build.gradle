@@ -4,7 +4,7 @@ plugins {
 }
 
 group = 'com.xaan'
-version = '0.0.1'
+version = '0.0.5'
 
 java {
     sourceCompatibility = '17'
@@ -18,9 +18,12 @@ repositories {
 dependencies {
     // Spring Vault core
     api 'org.springframework.vault:spring-vault-core:3.1.0'
-    
+
     // Spring context for @Service
     api 'org.springframework:spring-context:6.2.0'
+
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.11.3'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
 publishing {
