@@ -94,7 +94,7 @@ export PATH=$JAVA_HOME/bin:$PATH
 ./gradlew clean build publishToMavenLocal
 ```
 
-빌드된 JAR는 `~/.m2/repository/com/xaan/vault-crypto/0.0.6/`에 설치됩니다.
+빌드된 JAR는 `~/.m2/repository/com/xaan/vault-crypto/0.0.7/`에 설치됩니다.
 
 ## 의존성 추가
 
@@ -117,7 +117,7 @@ repositories {
 
 dependencies {
     // vault-crypto 라이브러리
-    implementation 'com.xaan:vault-crypto:0.0.6'
+    implementation 'com.xaan:vault-crypto:0.0.7'
 
     // Spring Cloud Vault (필수 의존성)
     implementation 'org.springframework.cloud:spring-cloud-starter-vault-config'
@@ -136,7 +136,7 @@ dependencyManagement {
 <dependency>
     <groupId>com.xaan</groupId>
     <artifactId>vault-crypto</artifactId>
-    <version>0.0.6</version>
+    <version>0.0.7</version>
 </dependency>
 ```
 
@@ -323,6 +323,39 @@ public class KeyRotationAdminService {
 
 `rotate()`는 새 DEK를 생성해 KEK로 wrap한 뒤 새 버전으로 저장하고 "current"로 지정합니다. 이전 버전은 `DekProvider`에 그대로 남아 있으므로, 다음 앱 재기동 시 `DomainKeyRing`이 신규/기존 버전을 모두 로드해 과거에 암호화된 데이터도 계속 복호화할 수 있습니다.
 
+### DEK 로테이션 이후 — 기존 행 재암호화 배치
+
+`rotate()`는 새 DEK 버전을 만들 뿐, 이미 저장된 행은 여전히 구버전으로 암호화된 채로 남아 있습니다. `currentVersion()`/`versionOf(...)`로 이미 최신인 행을 건너뛰면서 재암호화합니다. **`CryptoException`을 별도로 잡아야 합니다** — 이 라이브러리로 암호화된 적이 전혀 없는 행(예: 이 봉투 포맷 도입 이전의 레거시 데이터)이 섞여 있으면 `versionOf`가 반환하는 값이 우연히 `currentVersion()`과 다를 때 `decrypt()`가 호출되고, 헤더 바이트가 사실상 무작위라 `CryptoException`(도메인 불일치 또는 존재하지 않는 DEK 버전)이 나는데, 이건 실제 실패가 아니라 "이 라이브러리 포맷이 아니니 건드리지 말 것"이라는 신호입니다. demoApp에서 이걸 `failed`로 잘못 집계했다가 운영 DB에서 4만 건 이상의 오탐 에러 로그가 찍힌 뒤 고친 실전 사례가 있습니다 — 처음부터 아래처럼 구분해서 짜는 걸 권장합니다(도메인당 컬럼 하나를 가정한 예시; demoApp의 `DekReencryptionService`/`DekOpsRunner`가 실제 구현):
+
+```java
+public MigrationResult reencryptDomain(EnvelopeCryptoService domainService, List<MyRow> rows) {
+    int migrated = 0, skipped = 0, notEnvelopeFormat = 0, failed = 0;
+    for (MyRow row : rows) {
+        String ciphertext = row.getEncryptedColumn();
+        if (ciphertext == null || ciphertext.isEmpty()) {
+            skipped++;
+            continue;
+        }
+        try {
+            if (domainService.versionOf(ciphertext) == domainService.currentVersion()) {
+                skipped++;   // 이미 최신 버전 - 복호화/재암호화 안 함
+                continue;
+            }
+            String plain = domainService.decrypt(ciphertext);
+            row.setEncryptedColumn(domainService.encrypt(plain));
+            migrated++;
+        } catch (CryptoException e) {
+            notEnvelopeFormat++;   // 이 라이브러리 포맷이 아님 - 행별 로깅 없이 그냥 건너뜀 (많을 수 있음)
+        } catch (RuntimeException e) {
+            failed++;               // 진짜 예기치 못한 에러만 여기로 - 행별로 로깅해서 조사
+        }
+    }
+    return new MigrationResult(migrated, skipped, notEnvelopeFormat, failed);
+}
+```
+
+여러 번 실행해도 안전합니다(idempotent) — 이미 최신 버전인 행은 `versionOf(...) == currentVersion()`에서 걸려 건너뜁니다.
+
 ### KEK 로테이션
 
 DEK 로테이션과 달리 KEK 로테이션은 **실제 데이터를 전혀 건드리지 않고, 도메인 수만큼의 wrapped DEK만 재wrap**하면 끝납니다. 다만 순서가 중요합니다 — 새 KEK 버전을 발급한 뒤, **옛 버전과 새 버전을 모두 로드한 `KekService`로 재wrap을 마쳐야만** 옛 KEK를 지울 수 있습니다.
@@ -394,6 +427,8 @@ public class KeyRotationAdminService {
 | `encrypt(String plainText)` | 평문 | Base64 URL-safe 문자열 | 현재 버전 DEK로 AES-256 GCM 암호화 |
 | `decrypt(String encryptedText)` | 암호문 | 평문 | 헤더의 버전에 맞는 DEK로 복호화. 도메인/버전 불일치 시 `CryptoException` |
 | `validate(String input, String storedEncrypted)` | 평문, 저장된 암호문 | `boolean` | 상수 시간 비교로 Timing Attack 방지, 복호화 실패 시 `false` |
+| `currentVersion()` | - | `int` | `encrypt()`가 지금 사용 중인 DEK 버전 — 로테이션 후 재암호화 배치가 "이 값으로 수렴시켜야 할 목표 버전"으로 사용 |
+| `versionOf(String encryptedText)` | 암호문 | `int` | 복호화하지 않고 헤더의 `keyVersion`만 읽음 — 재암호화 배치가 `versionOf(row) != currentVersion()`인 행만 골라 처리하도록 해 이미 최신인 행은 건너뜀 |
 
 ### 암호화 데이터 형식 (EnvelopeCryptoService, 컬럼에 저장되는 값)
 
@@ -482,6 +517,15 @@ CryptoException: Envelope domain mismatch: expected ... but got ...
 - 암호문이 이 라이브러리의 봉투 포맷이 아님(예: 다른 방식으로 암호화된 값)
 
 ## Release History
+
+### v0.0.7 (2026-08-20)
+
+**재암호화 배치를 위한 버전 조회 API 추가** — DEK 로테이션 런북의 "점진적 재암호화" 단계가 실제로 구현 가능하도록 하는 최소한의 API.
+
+**Changes:**
+- `EnvelopeCryptoService.currentVersion()` 추가 — `encrypt()`가 지금 쓰는 DEK 버전 조회
+- `EnvelopeCryptoService.versionOf(String)` 추가 — 복호화 없이 암호문 헤더의 `keyVersion`만 읽음. 재암호화 배치가 이미 최신 버전인 행을 건너뛸 수 있게 해줌
+- 기능 변경 없음, 순수 추가(non-breaking)
 
 ### v0.0.6 (2026-08-20)
 

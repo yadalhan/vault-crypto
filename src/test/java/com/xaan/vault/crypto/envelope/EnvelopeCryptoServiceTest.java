@@ -80,6 +80,24 @@ class EnvelopeCryptoServiceTest {
         assertFalse(encryptedUnderV1.equals(encryptedUnderV2));
     }
 
+    @Test
+    void currentVersionAndVersionOfSupportAReencryptionBatch() {
+        EnvelopeCryptoService boardV1 = EnvelopeCryptoService.forDomain(BOARD_DOMAIN_CODE, "board", kek, dekProvider);
+        String encryptedUnderV1 = boardV1.encrypt("pre-rotation-value");
+
+        DekRotationSupport rotation = new DekRotationSupport(kek, dekProvider);
+        rotation.rotate("board");
+        EnvelopeCryptoService boardAfterRotation = EnvelopeCryptoService.forDomain(BOARD_DOMAIN_CODE, "board", kek, dekProvider);
+
+        assertEquals(2, boardAfterRotation.currentVersion());
+        assertEquals(1, boardAfterRotation.versionOf(encryptedUnderV1));
+
+        // A reencryption batch would see versionOf() != currentVersion() and know to migrate this row.
+        String reencrypted = boardAfterRotation.encrypt(boardAfterRotation.decrypt(encryptedUnderV1));
+        assertEquals(boardAfterRotation.currentVersion(), boardAfterRotation.versionOf(reencrypted));
+        assertEquals("pre-rotation-value", boardAfterRotation.decrypt(reencrypted));
+    }
+
     private void seedDek(String domain, int version) {
         byte[] plaintextDek = randomBytes(32);
         byte[] wrapped = kek.wrap(plaintextDek);

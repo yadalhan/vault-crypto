@@ -32,6 +32,24 @@ public class EnvelopeCryptoService {
         return new EnvelopeCryptoService(domainCode, DomainKeyRing.load(domain, kek, dekProvider));
     }
 
+    /** The DEK version encrypt() currently uses - i.e. what a post-rotation reencryption batch should converge rows toward. */
+    public int currentVersion() {
+        return keyRing.currentVersion();
+    }
+
+    /**
+     * Reads the keyVersion recorded in a ciphertext's header without decrypting it -
+     * lets a reencryption batch skip rows already on {@link #currentVersion()} instead
+     * of paying for a decrypt+encrypt round trip on every row.
+     */
+    public int versionOf(String encryptedText) {
+        byte[] combined = Base64.getUrlDecoder().decode(encryptedText);
+        if (combined.length < 2) {
+            throw new CryptoException("Envelope too short: expected at least 2 header bytes, got " + combined.length);
+        }
+        return combined[1] & 0xFF;
+    }
+
     public String encrypt(String plainText) {
         var key = keyRing.currentKey();
         byte[] ivCiphertextTag = AesGcmCodec.encrypt(key.getEncoded(), plainText.getBytes(StandardCharsets.UTF_8));
