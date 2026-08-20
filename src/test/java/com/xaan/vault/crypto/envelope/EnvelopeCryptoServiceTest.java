@@ -94,12 +94,12 @@ class EnvelopeCryptoServiceTest {
 
     /** Minimal in-memory stand-in for {@link VaultDekProvider}, used to avoid a live Vault in tests. */
     private static final class InMemoryDekProvider implements DekProvider {
-        private final Map<String, List<WrappedDek>> versionsByDomain = new HashMap<>();
+        private final Map<String, Map<Integer, WrappedDek>> versionsByDomain = new HashMap<>();
         private final Map<String, Integer> currentVersionByDomain = new HashMap<>();
 
         @Override
         public List<WrappedDek> loadAll(String domain) {
-            return versionsByDomain.getOrDefault(domain, List.of());
+            return new ArrayList<>(versionsByDomain.getOrDefault(domain, Map.of()).values());
         }
 
         @Override
@@ -109,8 +109,13 @@ class EnvelopeCryptoServiceTest {
 
         @Override
         public void store(String domain, WrappedDek newVersion, int newCurrentVersion) {
-            versionsByDomain.computeIfAbsent(domain, d -> new ArrayList<>()).add(newVersion);
+            versionsByDomain.computeIfAbsent(domain, d -> new HashMap<>()).put(newVersion.version(), newVersion);
             currentVersionByDomain.put(domain, newCurrentVersion);
+        }
+
+        @Override
+        public void retire(String domain, int version) {
+            versionsByDomain.getOrDefault(domain, Map.of()).remove(version);
         }
     }
 }

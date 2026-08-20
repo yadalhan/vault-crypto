@@ -11,7 +11,7 @@ HashiCorp Vault 기반 KEK-DEK 봉투 암호화(Envelope Encryption) 라이브�
 - **KEK-DEK 봉투 암호화**: Vault의 KEK는 데이터를 직접 암호화하지 않고 도메인별 DEK를 wrap하는 용도로만 사용
 - **도메인 격리**: 서비스 도메인(예: `board`, `user-pii`)마다 독립된 DEK를 사용해 한 도메인의 키 유출이 다른 도메인으로 번지지 않음
 - **성능**: DEK는 앱 기동 시 1회 unwrap되어 메모리에 캐시되므로, 이후 암/복호화 호출은 Vault 네트워크 호출 없이 로컬에서 수행됨
-- **키 로테이션 지원**: 암호문에 `domainCode`+`keyVersion` 헤더를 포함해, DEK를 교체한 뒤에도 이전 버전으로 암호화된 데이터를 계속 복호화 가능
+- **키 로테이션 지원**: 암호문에 `domainCode`+`keyVersion` 헤더를, wrapped DEK에 `kekVersion` 헤더를 포함해 DEK/KEK를 각각 교체한 뒤에도 이전 버전으로 암호화(wrap)된 데이터를 계속 복호화(unwrap) 가능 — 상세 절차는 이 라이브러리를 사용하는 demoApp 저장소의 `KEY_ROTATION_RUNBOOK.md` 참고
 - **AES-256 GCM**: 인증된 암호화(Authenticated Encryption) 지원
 - **Spring 통합**: `VaultOperations`를 통한 Spring Cloud Vault 연동
 - **커스텀 예외**: `CryptoException`, `KeyLoadingException`으로 세밀한 오류 처리
@@ -30,13 +30,14 @@ HashiCorp Vault 기반 KEK-DEK 봉투 암호화(Envelope Encryption) 라이브�
 │                              │                                        │
 │                     DomainKeyRing (unwrap된 DEK를 버전별로 메모리 캐시) │
 ├──────────────────────────────────────────────────────────────────────┤
-│      KekService (KEK 보관, wrap/unwrap)   │  DekProvider (wrapped DEK 저장/조회) │
+│  KekService (버전별 KEK 보관, wrap/unwrap) │  DekProvider (wrapped DEK 저장/조회) │
+│         KekProvider (versioned)            │  VaultDekProvider (versioned)      │
 ├──────────────────────────────────────────────────────────────────────┤
 │                        Spring Cloud Vault                             │
 │                    (VaultOperations / VaultTemplate)                  │
 ├──────────────────────────────────────────────────────────────────────┤
 │                       HashiCorp Vault Server                          │
-│         kv-v2: kek (마스터 키) + dek/{domain} (wrapped DEK, 버전별)    │
+│    kv-v2: kek (버전별 마스터 키) + dek/{domain} (wrapped DEK, 버전별)  │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -49,7 +50,10 @@ vault-crypto/
 │   ├── KeyLoadingException.java          # Vault 키 로딩 예외
 │   └── envelope/
 │       ├── AesGcmCodec.java              # 공용 AES-256-GCM 바이트 코덱 (내부용)
-│       ├── KekService.java               # KEK 로드 + DEK wrap/unwrap
+│       ├── KekService.java               # 버전별 KEK 보관 + DEK wrap/unwrap
+│       ├── KekProvider.java              # 버전별 KEK 저장소 인터페이스
+│       ├── VaultKekProvider.java         # Vault KV-v2 기반 KekProvider 구현체
+│       ├── KekRotationSupport.java       # KEK 로테이션(신규 버전 발급 + DEK 재wrap) 유틸
 │       ├── WrappedDek.java               # (domain, version, wrappedBytes) 레코드
 │       ├── DekProvider.java              # wrapped DEK 저장소 인터페이스
 │       ├── VaultDekProvider.java         # Vault KV-v2 기반 DekProvider 구현체
@@ -90,7 +94,7 @@ export PATH=$JAVA_HOME/bin:$PATH
 ./gradlew clean build publishToMavenLocal
 ```
 
-빌드된 JAR는 `~/.m2/repository/com/xaan/vault-crypto/0.0.5/`에 설치됩니다.
+빌드된 JAR는 `~/.m2/repository/com/xaan/vault-crypto/0.0.6/`에 설치됩니다.
 
 ## 의존성 추가
 
@@ -113,7 +117,7 @@ repositories {
 
 dependencies {
     // vault-crypto 라이브러리
-    implementation 'com.xaan:vault-crypto:0.0.5'
+    implementation 'com.xaan:vault-crypto:0.0.6'
 
     // Spring Cloud Vault (필수 의존성)
     implementation 'org.springframework.cloud:spring-cloud-starter-vault-config'
@@ -132,7 +136,7 @@ dependencyManagement {
 <dependency>
     <groupId>com.xaan</groupId>
     <artifactId>vault-crypto</artifactId>
-    <version>0.0.5</version>
+    <version>0.0.6</version>
 </dependency>
 ```
 
@@ -146,22 +150,25 @@ vault secrets enable -path=ebiz_service kv-v2
 
 ### Step 2: KEK(마스터 키) 저장
 
+KEK도 DEK와 동일하게 버전별 필드 + `current-version` 포인터로 저장합니다(로테이션 시 이전 버전도 계속 읽을 수 있어야 하므로):
+
 ```bash
 vault kv put -mount=ebiz_service ebiz_db/kek \
-  kek="<Base64URL 인코딩된 32바이트 랜덤 키>"
+  kek-v1="<Base64URL 인코딩된 32바이트 랜덤 키>" \
+  current-version="1"
 ```
 
 ### Step 3: 도메인별 DEK 생성 및 저장 (KEK로 wrap된 상태로 저장)
 
-DEK는 애플리케이션이 임의로 생성해 KEK로 wrap한 뒤 저장해야 하므로, 단순 `vault kv put`만으로는 만들 수 없습니다. 값 계산은 `KekService.wrap(byte[])`를 그대로 쓰거나, 별도 부트스트랩 스크립트로 생성합니다. 저장 형태는 도메인당 시크릿 1개, 버전별 필드:
+DEK는 애플리케이션이 임의로 생성해 KEK로 wrap한 뒤 저장해야 하므로, 단순 `vault kv put`만으로는 만들 수 없습니다. 값 계산은 `KekService.wrap(byte[])`를 그대로 쓰거나, 별도 부트스트랩 스크립트로 생성합니다(demoApp의 `bootstrap_kek_dek.py` 참고). `wrap()`의 출력에는 이미 `kekVersion(1B)` 헤더가 포함되어 있으므로 별도로 버전을 더 붙일 필요는 없습니다. 저장 형태는 도메인당 시크릿 1개, DEK 버전별 필드:
 
 ```bash
 vault kv put -mount=ebiz_service ebiz_db/dek/board \
-  dek-v1="<Base64URL(IV+ciphertext+tag), KEK로 wrap된 DEK>" \
+  dek-v1="<Base64URL(kekVersion+IV+ciphertext+tag), KEK로 wrap된 DEK>" \
   current-version="1"
 
 vault kv put -mount=ebiz_service ebiz_db/dek/user-pii \
-  dek-v1="<Base64URL(IV+ciphertext+tag), KEK로 wrap된 DEK>" \
+  dek-v1="<Base64URL(kekVersion+IV+ciphertext+tag), KEK로 wrap된 DEK>" \
   current-version="1"
 ```
 
@@ -202,10 +209,15 @@ import org.springframework.vault.core.VaultOperations;
 public class CryptoConfig {
 
     @Bean
-    public KekService kekService(
+    public KekProvider kekProvider(
             VaultOperations vaultOperations,
             @Value("${vault.kek.path}") String kekPath) {
-        return new KekService(vaultOperations, kekPath);
+        return new VaultKekProvider(vaultOperations, kekPath);
+    }
+
+    @Bean
+    public KekService kekService(KekProvider kekProvider) {
+        return KekService.load(kekProvider); // loads every KEK version once at startup
     }
 
     @Bean
@@ -311,16 +323,68 @@ public class KeyRotationAdminService {
 
 `rotate()`는 새 DEK를 생성해 KEK로 wrap한 뒤 새 버전으로 저장하고 "current"로 지정합니다. 이전 버전은 `DekProvider`에 그대로 남아 있으므로, 다음 앱 재기동 시 `DomainKeyRing`이 신규/기존 버전을 모두 로드해 과거에 암호화된 데이터도 계속 복호화할 수 있습니다.
 
+### KEK 로테이션
+
+DEK 로테이션과 달리 KEK 로테이션은 **실제 데이터를 전혀 건드리지 않고, 도메인 수만큼의 wrapped DEK만 재wrap**하면 끝납니다. 다만 순서가 중요합니다 — 새 KEK 버전을 발급한 뒤, **옛 버전과 새 버전을 모두 로드한 `KekService`로 재wrap을 마쳐야만** 옛 KEK를 지울 수 있습니다.
+
+```java
+@Service
+public class KeyRotationAdminService {
+
+    private final KekProvider kekProvider;
+    private final DekProvider dekProvider;
+    private final KekRotationSupport rotationSupport;
+
+    public KeyRotationAdminService(KekProvider kekProvider, DekProvider dekProvider) {
+        this.kekProvider = kekProvider;
+        this.dekProvider = dekProvider;
+        this.rotationSupport = new KekRotationSupport(kekProvider);
+    }
+
+    /** 1단계: 새 KEK 버전 발급 (옛 버전은 그대로 유지). */
+    public int issueNewKek() {
+        return rotationSupport.issueNewKekVersion();
+    }
+
+    /** 2단계: 새 KEK 버전을 반영한 KekService로, 지정한 도메인의 모든 DEK를 재wrap. */
+    public void rewrap(String domain) {
+        KekService kekRing = KekService.load(kekProvider); // 옛 버전 + 새 버전 모두 로드됨
+        rotationSupport.rewrapDomainDeks(kekRing, dekProvider, domain);
+    }
+
+    /** 3단계: 모든 도메인의 재wrap이 끝났다고 확인된 뒤에만 호출. */
+    public void retireOldKek(int oldVersion) {
+        kekProvider.retire(oldVersion);
+    }
+}
+```
+
+전체 운영 절차(발급 → 재wrap → 검증 → 폐기, 재기동 타이밍, 롤백 시나리오 포함)는 demoApp 저장소의 `KEY_ROTATION_RUNBOOK.md`에 절차도와 함께 상세히 정리되어 있습니다.
+
 ## API 문서
 
 ### KekService
 
 | 생성자/메서드 | 설명 |
 |--------|------|
-| `KekService(VaultOperations, String kekSecretPath)` | Vault에서 KEK를 로드 |
-| `KekService(byte[] rawKekBytes)` | 테스트 등 Vault를 거치지 않는 경우용 |
-| `wrap(byte[] plaintextDek)` | DEK를 KEK로 감싸 저장용 바이트로 변환 |
-| `unwrap(byte[] wrappedDek)` | 저장된 wrapped DEK를 평문으로 복원 |
+| `static load(KekProvider)` | `KekProvider`에서 모든 KEK 버전과 현재 버전을 읽어 링을 구성 |
+| `KekService(Map<Integer,byte[]> kekByVersion, int currentVersion)` | 버전별 KEK를 직접 주입 |
+| `KekService(byte[] rawKekBytes)` | 테스트 등 단일 키(버전 1)만 필요한 경우용 |
+| `currentVersion()` | 현재 wrap에 사용되는 KEK 버전 번호 |
+| `wrap(byte[] plaintextDek)` | 현재 버전 KEK로 DEK를 감싸 저장용 바이트로 변환 (`kekVersion` 헤더 포함) |
+| `unwrap(byte[] wrappedDek)` | 헤더의 `kekVersion`에 맞는 KEK로 wrapped DEK를 평문으로 복원 |
+
+### KekProvider / VaultKekProvider / KekRotationSupport
+
+| 타입 | 역할 |
+|------|------|
+| `KekProvider` | 버전별 KEK 저장소 인터페이스 (`loadAll`, `loadCurrentVersion`, `store`, `retire`) |
+| `VaultKekProvider` | Vault KV-v2 기반 구현체 (`kek-v{n}` 필드 + `current-version`) |
+| `KekRotationSupport` | `issueNewKekVersion()`로 새 버전 발급, `rewrapDomainDeks(...)`로 도메인의 모든 DEK를 새 버전으로 재wrap |
+
+### DekProvider / VaultDekProvider
+
+`store(...)`에 더해 `retire(String domain, int version)`이 추가되었습니다 — 더 이상 필요 없는(모든 데이터가 새 버전으로 넘어간) DEK 버전을 영구 삭제합니다. **현재 버전은 retire할 수 없습니다.**
 
 ### EnvelopeCryptoService
 
@@ -331,16 +395,24 @@ public class KeyRotationAdminService {
 | `decrypt(String encryptedText)` | 암호문 | 평문 | 헤더의 버전에 맞는 DEK로 복호화. 도메인/버전 불일치 시 `CryptoException` |
 | `validate(String input, String storedEncrypted)` | 평문, 저장된 암호문 | `boolean` | 상수 시간 비교로 Timing Attack 방지, 복호화 실패 시 `false` |
 
-### 암호화 데이터 형식
+### 암호화 데이터 형식 (EnvelopeCryptoService, 컬럼에 저장되는 값)
 
 ```
 Base64URL( domainCode(1B) | keyVersion(1B) | IV(12B) | Ciphertext(N bytes) | GCM Auth Tag(16 bytes) )
 ```
 
 - **domainCode**: 도메인마다 고유한 1바이트 값 — 다른 도메인 DEK로 복호화를 시도하면 즉시 실패
-- **keyVersion**: DEK 로테이션 후에도 과거 버전으로 암호화된 데이터를 계속 복호화하기 위한 버전 정보
+- **keyVersion**: DEK 버전 — DEK 로테이션 후에도 과거 버전으로 암호화된 데이터를 계속 복호화하기 위한 정보
 - **IV**: 12 bytes (96 bits) — 매 암호화 시 `SecureRandom`으로 생성
 - **GCM Auth Tag**: 16 bytes (128 bits) — 데이터 무결성 검증
+
+### Wrapped DEK 형식 (KekService, Vault의 `dek-v{n}` 필드에 저장되는 값)
+
+```
+kekVersion(1B) | IV(12B) | Ciphertext(32 bytes, DEK 자체) | GCM Auth Tag(16 bytes)
+```
+
+- **kekVersion**: 이 DEK를 wrap한 KEK 버전 — KEK 로테이션 후에도 옛 버전 KEK로 wrap된 DEK를 계속 unwrap하기 위한 정보. 별도의 Vault 필드가 아니라 wrapped 바이트 자체에 포함되어 있어(self-describing), `WrappedDek`/`DekProvider`는 이 값을 알 필요가 없음
 
 ### 예외 클래스
 
@@ -360,7 +432,8 @@ Base64URL( domainCode(1B) | keyVersion(1B) | IV(12B) | Ciphertext(N bytes) | GCM
 | **GCM 모드** | 매 암호화 시 랜덤 IV를 생성하므로 동일 평문도 다른 암호문 생성 |
 | **인증 암호화** | GCM 모드의 Auth Tag로 데이터 변조 탐지 |
 | **Timing Attack 방지** | `validate()` 메서드는 `MessageDigest.isEqual()`로 상수 시간 비교 |
-| **키 로테이션** | 암호문에 포함된 `keyVersion`으로 DEK 교체 후에도 과거 데이터 복호화 가능 |
+| **DEK 로테이션** | 암호문에 포함된 `keyVersion`으로 DEK 교체 후에도 과거 데이터 복호화 가능 |
+| **KEK 로테이션** | wrapped DEK에 포함된 `kekVersion`으로 KEK 교체 후에도 옛 버전으로 wrap된 DEK를 계속 unwrap 가능 — 실제 데이터 재암호화 없이 도메인 수만큼의 DEK만 재wrap하면 됨 |
 | **Fail-fast** | `spring.cloud.vault.fail-fast=true` 설정 시 Vault 미연결 시 앱 시작 차단 |
 
 ## Troubleshooting
@@ -388,6 +461,16 @@ KeyLoadingException: No DEK versions found for domain '...' at ...
 2. 시크릿에 `dek-v1`, `current-version` 필드가 모두 있는지
 3. `current-version`이 가리키는 버전의 `dek-v{n}` 필드가 실제로 존재하는지
 
+### KEK를 unwrap할 수 없음
+
+```
+CryptoException: No KEK version ... loaded
+```
+
+**가능한 원인:**
+- 그 wrapped DEK를 wrap했던 KEK 버전이 지금 로드된 `KekService`에 없음 — 보통 옛 KEK 버전을 로드하지 않은 상태에서(또는 이미 retire된 뒤) 아직 재wrap되지 않은 DEK를 unwrap하려 할 때 발생
+- KEK 로테이션 절차(발급 → 재wrap → 검증 → 폐기) 순서를 지키지 않고 옛 버전을 먼저 지웠을 가능성 — `KEY_ROTATION_RUNBOOK.md` 참고
+
 ### 복호화 실패
 
 ```
@@ -399,6 +482,21 @@ CryptoException: Envelope domain mismatch: expected ... but got ...
 - 암호문이 이 라이브러리의 봉투 포맷이 아님(예: 다른 방식으로 암호화된 값)
 
 ## Release History
+
+### v0.0.6 (2026-08-20)
+
+**KEK 로테이션 지원 (Breaking change)** — KEK를 버전 관리 없이 단일 값으로만 다루던 갭을 메꿨습니다. 이전 구조에서는 Vault의 `kek` 값을 교체하는 순간 모든 도메인의 모든 DEK unwrap이 동시에 실패했습니다(전체 장애).
+
+**Changes:**
+- `KekService`를 `DomainKeyRing`과 동일한 패턴으로 재작성 — 여러 KEK 버전을 메모리에 보관하고, wrapped DEK 앞에 붙은 `kekVersion(1B)` 헤더로 올바른 버전을 선택해 unwrap
+- `KekProvider`/`VaultKekProvider` 추가 — KEK도 DEK처럼 `kek-v{n}` + `current-version` 형식으로 Vault에 버전별 저장
+- `KekRotationSupport` 추가 — `issueNewKekVersion()`(신규 KEK 버전 발급)과 `rewrapDomainDeks(...)`(도메인의 모든 DEK를 새 KEK 버전으로 재wrap, 실제 데이터는 건드리지 않음)
+- `DekProvider`/`VaultDekProvider`와 `KekProvider`/`VaultKekProvider` 모두에 `retire(...)` 추가 — 더 이상 필요 없는 버전을 영구 삭제(현재 버전은 거부)
+- `KekService`의 기존 `VaultOperations` 직접 생성자 제거 — `KekService.load(KekProvider)`로 대체 (Breaking)
+
+**Breaking**: wrapped DEK 바이트 포맷이 바뀌었습니다(`kekVersion` 헤더 1바이트 추가). v0.0.5 이하에서 만든 wrapped DEK는 새 코드로 unwrap할 수 없으므로, KEK/DEK를 다시 생성해야 합니다.
+
+**Migration**: `new KekService(vaultOperations, kekPath)`를 쓰던 코드는 `VaultKekProvider` + `KekService.load(...)` 조합으로 옮기세요. Vault의 `kek` 필드는 `kek-v1` + `current-version=1`로 다시 저장해야 합니다.
 
 ### v0.0.5 (2026-08-19)
 

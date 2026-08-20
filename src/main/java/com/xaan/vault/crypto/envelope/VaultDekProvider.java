@@ -70,6 +70,25 @@ public class VaultDekProvider implements DekProvider {
         vaultOperations.write(domainPath(domain), Map.of("data", fields));
     }
 
+    @Override
+    public void retire(String domain, int version) {
+        int currentVersion = loadCurrentVersion(domain);
+        if (version == currentVersion) {
+            throw new IllegalArgumentException(
+                    "Refusing to retire DEK version " + version + " for domain '" + domain + "' - it is the current version");
+        }
+
+        Map<String, Object> fields = new LinkedHashMap<>();
+        for (WrappedDek existing : loadAll(domain)) {
+            if (existing.version() != version) {
+                fields.put(VERSION_FIELD_PREFIX + existing.version(), encode(existing.wrappedBytes()));
+            }
+        }
+        fields.put(CURRENT_VERSION_FIELD, String.valueOf(currentVersion));
+
+        vaultOperations.write(domainPath(domain), Map.of("data", fields));
+    }
+
     @SuppressWarnings("unchecked")
     private Map<String, Object> readSecretData(String domain) {
         String path = domainPath(domain);

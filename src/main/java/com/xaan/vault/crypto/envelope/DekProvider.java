@@ -19,4 +19,11 @@ public interface DekProvider {
      * Existing versions must remain readable after this call.
      */
     void store(String domain, WrappedDek newVersion, int newCurrentVersion);
+
+    /**
+     * Permanently removes one DEK version for the domain. Callers must ensure no
+     * data still relies on this version (and it must not be the current version)
+     * before calling this - it is not reversible.
+     */
+    void retire(String domain, int version);
 }
