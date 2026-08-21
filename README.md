@@ -197,7 +197,114 @@ vault.dek.base-path=${VAULT_DEK_BASE_PATH:ebiz_service/data/ebiz_db/dek}
 
 ## 사용 가이드
 
-### 기본 사용법 — 도메인별 EnvelopeCryptoService 구성
+vault-crypto는 성격이 다른 두 종류의 암호화를 제공합니다. 다루는 값이 "원문을 다시 볼 필요가 있는가"에 따라 골라 쓰면 됩니다.
+
+| | **단방향 (One-way) — BCrypt** | **양방향 (Two-way) — KEK-DEK 봉투 암호화** |
+|---|---|---|
+| 제공 클래스 | `PasswordHasher` | `EnvelopeCryptoService` |
+| 원문 복구 | 불가능 (해시만 비교) | 가능 (`decrypt()`로 원문 복원) |
+| 대표 용도 | 로그인 계정 비밀번호 | 게시글 비밀번호, 주민등록번호 등 개인정보 |
+| 키 관리 | 불필요 (솔트를 자체 생성해 결과 문자열에 내장) | 필요 (Vault의 KEK가 도메인별 DEK를 wrap) |
+| Vault 의존성 | 없음 | 있음 (앱 기동 시 1회 로드, 이후 요청은 로컬에서만 처리) |
+| 저장 형식 예 | `$2a$10$N9qo8uLOickgx2ZMRZoMy...` | `AQHx9F3...`(Base64, `domainCode+keyVersion+IV+ciphertext+tag`) |
+
+아래에서 각각을 Spring Boot 프로젝트에 통합하는 전체 예제(Config → Service → Controller → curl 호출까지)를 다룹니다.
+
+---
+
+### 1. 단방향 암호화 — BCrypt로 로그인 비밀번호 다루기
+
+"맞는지 검증"만 하면 되고 원문 복구가 필요 없는 값(로그인 비밀번호)은 `PasswordHasher`를 씁니다. BCrypt는 솔트를 자체 생성해 결과 문자열에 내장하므로 외부 키가 필요 없고, 따라서 Vault 설정이나 KEK/DEK 부트스트랩 없이 바로 쓸 수 있습니다.
+
+#### 1-1. Service
+
+```java
+import com.xaan.vault.crypto.PasswordHasher;
+import org.springframework.stereotype.Service;
+
+@Service
+public class UserService {
+
+    private final PasswordHasher passwordHasher = new PasswordHasher();
+    private final UserRepository userRepository;
+
+    public UserService(UserRepository userRepository) {
+        this.userRepository = userRepository;
+    }
+
+    public Long register(String userId, String rawPassword) {
+        String hashed = passwordHasher.hash(rawPassword); // 매 호출마다 다른 솔트 -> 다른 결과 문자열
+        User user = new User(userId, hashed);
+        return userRepository.save(user).getId();
+    }
+
+    public boolean login(String userId, String rawPassword) {
+        return userRepository.findByUserId(userId)
+                .map(user -> passwordHasher.matches(rawPassword, user.getPassword()))
+                .orElse(false);
+    }
+}
+```
+
+#### 1-2. Controller
+
+```java
+@RestController
+@RequestMapping("/api/users")
+public class UserController {
+
+    private final UserService userService;
+
+    public UserController(UserService userService) { this.userService = userService; }
+
+    @PostMapping("/register")
+    public ResponseEntity<Long> register(@RequestBody RegisterRequest req) {
+        return ResponseEntity.ok(userService.register(req.userId(), req.password()));
+    }
+
+    @PostMapping("/login")
+    public ResponseEntity<String> login(@RequestBody LoginRequest req) {
+        return userService.login(req.userId(), req.password())
+                ? ResponseEntity.ok("로그인 성공")
+                : ResponseEntity.status(401).body("아이디 또는 비밀번호가 일치하지 않습니다");
+    }
+
+    public record RegisterRequest(String userId, String password) {}
+    public record LoginRequest(String userId, String password) {}
+}
+```
+
+#### 1-3. 호출 예시
+
+```bash
+curl -X POST http://localhost:8080/api/users/register \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"alice","password":"s3cret!"}'
+# -> 1  (신규 사용자 id)
+
+# DB의 users.password 컬럼: $2a$10$N9qo8uLOickgx2ZMRZoMy.MyrCwtGGY0hJIVvZmvHDpXGVKcqOF6O
+#   -> 원문 "s3cret!"은 어디에도 남지 않고, 매번 다른 솔트라 같은 원문을 두 번 해시해도 결과가 다름
+
+curl -X POST http://localhost:8080/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"alice","password":"s3cret!"}'
+# -> 200 OK "로그인 성공"
+
+curl -X POST http://localhost:8080/api/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"alice","password":"wrong-password"}'
+# -> 401 Unauthorized "아이디 또는 비밀번호가 일치하지 않습니다"
+```
+
+`decrypt()`에 해당하는 메서드가 아예 없다는 점이 핵심입니다 — DB가 통째로 유출되어도 저장된 해시에서 원문 비밀번호를 복원할 방법이 없습니다.
+
+---
+
+### 2. 양방향 암호화 — KEK-DEK 봉투 암호화로 게시글 비밀번호/개인정보 다루기
+
+나중에 원문이 다시 필요한 값(게시글 비밀번호 확인 화면, 개인정보 조회 등)은 `EnvelopeCryptoService`를 씁니다. 앞의 [Vault 설정](#vault-설정) 단계(KEK/DEK를 Vault에 저장)가 먼저 끝나 있어야 합니다.
+
+#### 2-1. Config — 도메인별 `EnvelopeCryptoService` 빈 구성
 
 ```java
 import com.xaan.vault.crypto.envelope.*;
@@ -218,7 +325,7 @@ public class CryptoConfig {
 
     @Bean
     public KekService kekService(KekProvider kekProvider) {
-        return KekService.load(kekProvider); // loads every KEK version once at startup
+        return KekService.load(kekProvider); // 모든 KEK 버전을 앱 기동 시 1회 로드
     }
 
     @Bean
@@ -241,30 +348,9 @@ public class CryptoConfig {
 }
 ```
 
-`EnvelopeCryptoService.forDomain(...)`이 호출되는 시점(보통 빈 생성 시, 즉 앱 기동 시)에 KEK로 해당 도메인의 DEK를 1회 unwrap해서 메모리에 캐시합니다. 이후 `encrypt()`/`decrypt()`/`validate()` 호출은 Vault를 다시 호출하지 않습니다.
+`EnvelopeCryptoService.forDomain(...)`이 호출되는 시점(빈 생성 시, 즉 앱 기동 시)에 KEK로 해당 도메인의 DEK를 1회 unwrap해서 메모리에 캐시합니다. 이후 `encrypt()`/`decrypt()`/`validate()` 호출은 Vault를 다시 호출하지 않습니다.
 
-```java
-@Service
-public class BoardService {
-
-    private final EnvelopeCryptoService boardCryptoService;
-
-    public BoardService(@Qualifier("boardCryptoService") EnvelopeCryptoService boardCryptoService) {
-        this.boardCryptoService = boardCryptoService;
-    }
-
-    public String example(String password) {
-        String encrypted = boardCryptoService.encrypt(password);
-        String decrypted = boardCryptoService.decrypt(encrypted);
-        boolean matches = boardCryptoService.validate(password, encrypted);
-        return encrypted;
-    }
-}
-```
-
----
-
-### 실전 예제: 게시판 비밀번호 + 개인정보를 별도 도메인으로 분리
+#### 2-2. Service — 도메인 간 키 분리 (게시글 비밀번호 vs 개인정보)
 
 ```java
 @Service
@@ -302,50 +388,65 @@ public class PasswordService {
 
 `board` DEK로 암호화한 값은 `user-pii` 서비스로 복호화를 시도하면 `domainCode` 불일치로 항상 `CryptoException`이 발생합니다 — 도메인 간 키가 섞이지 않는다는 것을 애플리케이션 레벨에서도 보장합니다.
 
----
-
-### 로그인 비밀번호 해싱 — PasswordHasher (BCrypt)
-
-로그인 계정 비밀번호처럼 "맞는지 검증"만 하면 되고 원문 복구가 필요 없는 값은 봉투 암호화 대신 BCrypt 단방향 해시를 씁니다. BCrypt는 솔트를 자체 생성해 결과 문자열에 내장하므로 외부 키가 필요 없고, 따라서 Vault/KEK/DEK와는 무관합니다 — `PasswordHasher`는 Vault 설정 없이 바로 사용할 수 있습니다:
+#### 2-3. Controller — 비밀번호가 걸린 게시글 등록/조회
 
 ```java
-import com.xaan.vault.crypto.PasswordHasher;
+@RestController
+@RequestMapping("/api/posts")
+public class PostController {
 
-@Service
-public class UserService {
+    private final PasswordService passwordService;
+    private final PostRepository postRepository;
 
-    private final PasswordHasher passwordHasher = new PasswordHasher();
-
-    public String register(String rawPassword) {
-        return passwordHasher.hash(rawPassword); // DB에 저장
+    public PostController(PasswordService passwordService, PostRepository postRepository) {
+        this.passwordService = passwordService;
+        this.postRepository = postRepository;
     }
 
-    public boolean login(String rawPassword, String storedHash) {
-        return passwordHasher.matches(rawPassword, storedHash);
+    @PostMapping
+    public ResponseEntity<Long> save(@RequestBody SaveRequest req) {
+        String encryptedPassword = passwordService.encryptBoardPassword(req.password());
+        Post post = new Post(req.title(), req.content(), encryptedPassword);
+        return ResponseEntity.ok(postRepository.save(post).getId());
     }
+
+    @PostMapping("/{id}/view")
+    public ResponseEntity<String> view(@PathVariable Long id, @RequestBody ViewRequest req) {
+        Post post = postRepository.findById(id).orElseThrow();
+        if (!passwordService.validateBoardPassword(req.password(), post.getPassword())) {
+            return ResponseEntity.status(403).body("비밀번호가 일치하지 않습니다");
+        }
+        return ResponseEntity.ok(post.getContent()); // content 컬럼 자체는 암호화 대상이 아님 - 암호화된 건 password 컬럼뿐
+    }
+
+    public record SaveRequest(String title, String content, String password) {}
+    public record ViewRequest(String password) {}
 }
 ```
 
-애플리케이션이 게시글 비밀번호(봉투 암호화)와 로그인 비밀번호(BCrypt 해시)를 모두 다룬다면, 두 크립토 프리미티브를 한 서비스에서 감싸 애플리케이션 코드가 어느 쪽도 직접 참조하지 않게 할 수 있습니다:
+#### 2-4. 호출 예시
 
-```java
-@Service
-public class PasswordService {
+```bash
+curl -X POST http://localhost:8080/api/posts \
+  -H "Content-Type: application/json" \
+  -d '{"title":"비공개 글","content":"본문 내용","password":"1234"}'
+# -> 5  (신규 게시글 id)
 
-    private final PasswordHasher passwordHasher = new PasswordHasher();
-    private final EnvelopeCryptoService boardCryptoService;
+# DB의 board.password 컬럼: AQHZjK3F9pQ2mR8wXeYq7B0vN1sT6uL4c...  (Base64, 매번 다른 값)
+#   -> 같은 "1234"를 다시 암호화해도 IV가 매번 랜덤이라 저장값은 매번 달라짐
 
-    public PasswordService(@Qualifier("boardCryptoService") EnvelopeCryptoService boardCryptoService) {
-        this.boardCryptoService = boardCryptoService;
-    }
+curl -X POST http://localhost:8080/api/posts/5/view \
+  -H "Content-Type: application/json" \
+  -d '{"password":"1234"}'
+# -> 200 OK "본문 내용"
 
-    public String hashUserPassword(String password) { return passwordHasher.hash(password); }
-    public boolean validateUserPassword(String raw, String hashed) { return passwordHasher.matches(raw, hashed); }
-
-    public String encryptBoardPassword(String password) { return boardCryptoService.encrypt(password); }
-    public boolean validateBoardPassword(String raw, String encrypted) { return boardCryptoService.validate(raw, encrypted); }
-}
+curl -X POST http://localhost:8080/api/posts/5/view \
+  -H "Content-Type: application/json" \
+  -d '{"password":"0000"}'
+# -> 403 Forbidden "비밀번호가 일치하지 않습니다"
 ```
+
+`encryptBoardPassword()`로 저장한 값은 필요하면 `boardCryptoService.decrypt(encrypted)`로 원문 `"1234"`를 그대로 복원할 수 있습니다 — BCrypt와 달리 되돌리기가 가능하다는 점이 이 방식을 선택하는 이유입니다(예: 관리자가 원문을 확인해야 하는 업무 요건이 있을 때). 단순히 "맞는지"만 확인하면 되는 경우엔 `decrypt()` 대신 `validate()`를 쓰는 편이 낫습니다 — 상수 시간 비교로 Timing Attack을 막아주기 때문입니다.
 
 ---
 
