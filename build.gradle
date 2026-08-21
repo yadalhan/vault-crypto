@@ -4,7 +4,7 @@ plugins {
 }
 
 group = 'com.xaan'
-version = '0.0.7'
+version = '0.0.8'
 
 java {
     sourceCompatibility = '17'
@@ -21,6 +21,9 @@ dependencies {
 
     // Spring context for @Service
     api 'org.springframework:spring-context:6.2.0'
+
+    // BCrypt password hashing (PasswordHasher) - needs no external key, so no Vault dependency
+    implementation 'org.springframework.security:spring-security-crypto:6.4.1'
 
     testImplementation 'org.junit.jupiter:junit-jupiter:5.11.3'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'

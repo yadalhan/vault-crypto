@@ -48,6 +48,7 @@ vault-crypto/
 ├── src/main/java/com/xaan/vault/crypto/
 │   ├── CryptoException.java              # 암호화 관련 기본 예외
 │   ├── KeyLoadingException.java          # Vault 키 로딩 예외
+│   ├── PasswordHasher.java               # BCrypt 단방향 해시 (외부 키 불필요, Vault 무관)
 │   └── envelope/
 │       ├── AesGcmCodec.java              # 공용 AES-256-GCM 바이트 코덱 (내부용)
 │       ├── KekService.java               # 버전별 KEK 보관 + DEK wrap/unwrap
@@ -94,7 +95,7 @@ export PATH=$JAVA_HOME/bin:$PATH
 ./gradlew clean build publishToMavenLocal
 ```
 
-빌드된 JAR는 `~/.m2/repository/com/xaan/vault-crypto/0.0.7/`에 설치됩니다.
+빌드된 JAR는 `~/.m2/repository/com/xaan/vault-crypto/0.0.8/`에 설치됩니다.
 
 ## 의존성 추가
 
@@ -117,7 +118,7 @@ repositories {
 
 dependencies {
     // vault-crypto 라이브러리
-    implementation 'com.xaan:vault-crypto:0.0.7'
+    implementation 'com.xaan:vault-crypto:0.0.8'
 
     // Spring Cloud Vault (필수 의존성)
     implementation 'org.springframework.cloud:spring-cloud-starter-vault-config'
@@ -136,7 +137,7 @@ dependencyManagement {
 <dependency>
     <groupId>com.xaan</groupId>
     <artifactId>vault-crypto</artifactId>
-    <version>0.0.7</version>
+    <version>0.0.8</version>
 </dependency>
 ```
 
@@ -300,6 +301,51 @@ public class PasswordService {
 ```
 
 `board` DEK로 암호화한 값은 `user-pii` 서비스로 복호화를 시도하면 `domainCode` 불일치로 항상 `CryptoException`이 발생합니다 — 도메인 간 키가 섞이지 않는다는 것을 애플리케이션 레벨에서도 보장합니다.
+
+---
+
+### 로그인 비밀번호 해싱 — PasswordHasher (BCrypt)
+
+로그인 계정 비밀번호처럼 "맞는지 검증"만 하면 되고 원문 복구가 필요 없는 값은 봉투 암호화 대신 BCrypt 단방향 해시를 씁니다. BCrypt는 솔트를 자체 생성해 결과 문자열에 내장하므로 외부 키가 필요 없고, 따라서 Vault/KEK/DEK와는 무관합니다 — `PasswordHasher`는 Vault 설정 없이 바로 사용할 수 있습니다:
+
+```java
+import com.xaan.vault.crypto.PasswordHasher;
+
+@Service
+public class UserService {
+
+    private final PasswordHasher passwordHasher = new PasswordHasher();
+
+    public String register(String rawPassword) {
+        return passwordHasher.hash(rawPassword); // DB에 저장
+    }
+
+    public boolean login(String rawPassword, String storedHash) {
+        return passwordHasher.matches(rawPassword, storedHash);
+    }
+}
+```
+
+애플리케이션이 게시글 비밀번호(봉투 암호화)와 로그인 비밀번호(BCrypt 해시)를 모두 다룬다면, 두 크립토 프리미티브를 한 서비스에서 감싸 애플리케이션 코드가 어느 쪽도 직접 참조하지 않게 할 수 있습니다:
+
+```java
+@Service
+public class PasswordService {
+
+    private final PasswordHasher passwordHasher = new PasswordHasher();
+    private final EnvelopeCryptoService boardCryptoService;
+
+    public PasswordService(@Qualifier("boardCryptoService") EnvelopeCryptoService boardCryptoService) {
+        this.boardCryptoService = boardCryptoService;
+    }
+
+    public String hashUserPassword(String password) { return passwordHasher.hash(password); }
+    public boolean validateUserPassword(String raw, String hashed) { return passwordHasher.matches(raw, hashed); }
+
+    public String encryptBoardPassword(String password) { return boardCryptoService.encrypt(password); }
+    public boolean validateBoardPassword(String raw, String encrypted) { return boardCryptoService.validate(raw, encrypted); }
+}
+```
 
 ---
 
@@ -517,6 +563,15 @@ CryptoException: Envelope domain mismatch: expected ... but got ...
 - 암호문이 이 라이브러리의 봉투 포맷이 아님(예: 다른 방식으로 암호화된 값)
 
 ## Release History
+
+### v0.0.8 (2026-08-21)
+
+**PasswordHasher 추가 (BCrypt 단방향 해시)** — 로그인 비밀번호처럼 원문 복구가 필요 없는 값을 위한 유틸리티. Vault/KEK/DEK와는 무관하지만(BCrypt는 외부 키가 필요 없음), 애플리케이션이 "비밀번호 관련 크립토 로직은 전부 vault-crypto에서" 가져오도록 일원화하기 위해 여기 추가했습니다.
+
+**Changes:**
+- `PasswordHasher` 추가 (`com.xaan.vault.crypto`) — `hash(String)`/`matches(String, String)`, 내부적으로 `BCryptPasswordEncoder` 사용
+- `spring-security-crypto:6.4.1`을 `implementation` 의존성으로 추가 (라이브러리 소비 프로젝트의 컴파일 클래스패스에는 노출되지 않고, 런타임에는 전이적으로 포함됨)
+- 기능 변경 없음, 순수 추가(non-breaking)
 
 ### v0.0.7 (2026-08-20)
 
