@@ -4,7 +4,7 @@ plugins {
 }
 
 group = 'com.xaan'
-version = '0.0.8'
+version = '0.0.9'
 
 java {
     sourceCompatibility = '17'
@@ -25,7 +25,14 @@ dependencies {
     // BCrypt password hashing (PasswordHasher) - needs no external key, so no Vault dependency
     implementation 'org.springframework.security:spring-security-crypto:6.4.1'
 
+    // MyBatis TypeHandler support (EnvelopeCryptoTypeHandler) - compileOnly so projects that
+    // don't use MyBatis aren't forced to pull it in; MyBatis-based consumers already have it
+    // on their own runtime classpath
+    compileOnly 'org.mybatis:mybatis:3.5.16'
+
     testImplementation 'org.junit.jupiter:junit-jupiter:5.11.3'
+    testImplementation 'org.mybatis:mybatis:3.5.16'
+    testImplementation 'com.h2database:h2:2.3.232'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 

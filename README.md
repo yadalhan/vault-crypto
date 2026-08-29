@@ -61,6 +61,12 @@ vault-crypto/
 │       ├── DomainKeyRing.java            # 도메인별 unwrap된 DEK 메모리 캐시
 │       ├── EnvelopeCryptoService.java    # 도메인 스코프 encrypt/decrypt/validate
 │       └── DekRotationSupport.java       # DEK 로테이션(신규 버전 발급) 유틸
+│   ├── blindindex/
+│   │   ├── BlindIndexKeyProvider.java    # 필드별 HMAC 키 저장소 인터페이스 (버전 없음)
+│   │   ├── VaultBlindIndexKeyProvider.java # Vault KV-v2 기반 BlindIndexKeyProvider 구현체
+│   │   └── BlindIndexService.java        # HMAC-SHA256 기반 결정적 blind index 계산
+│   └── mybatis/
+│       └── EnvelopeCryptoTypeHandler.java # MyBatis TypeHandler - 컬럼 단위 투명 암/복호화
 ├── build.gradle                   # Gradle 빌드 설정
 ├── settings.gradle                # 프로젝트 설정
 └── README.md
@@ -450,6 +456,146 @@ curl -X POST http://localhost:8080/api/posts/5/view \
 
 ---
 
+### 3. MyBatis 프로젝트에서 최소 변경으로 통합 — EnvelopeCryptoTypeHandler
+
+위 예제들처럼 Service 계층에서 `encrypt()`/`decrypt()`를 직접 호출하는 대신, MyBatis의 `TypeHandler`로 컬럼 단위 암/복호화를 감출 수 있습니다. Mapper의 SQL과 그걸 호출하는 Service 코드는 평문 `String`만 다루면 되고, 실제 암/복호화는 JDBC 파라미터를 세팅하거나 `ResultSet`을 읽는 시점에 투명하게 일어납니다.
+
+#### 3-1. 도메인별 TypeHandler 서브클래스
+
+`EnvelopeCryptoTypeHandler`는 `EnvelopeCryptoService` 하나에 고정된 컬럼 하나를 담당합니다. MyBatis는 `typeHandler=...`를 **클래스**로만 참조할 수 있어서 도메인마다 별도 서브클래스가 필요합니다 — `mybatis-spring-boot-starter`가 Spring 빈으로 등록된 TypeHandler를 인식하므로, 생성자로 원하는 도메인의 `EnvelopeCryptoService`를 주입받게만 만들면 됩니다:
+
+```java
+import com.xaan.vault.crypto.mybatis.EnvelopeCryptoTypeHandler;
+import com.xaan.vault.crypto.envelope.EnvelopeCryptoService;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.stereotype.Component;
+
+@Component
+public class BoardPasswordTypeHandler extends EnvelopeCryptoTypeHandler {
+    public BoardPasswordTypeHandler(@Qualifier("boardCryptoService") EnvelopeCryptoService cryptoService) {
+        super(cryptoService);
+    }
+}
+```
+
+#### 3-2. Mapper에서 컬럼 단위로 지정
+
+```java
+@Mapper
+public interface PostMapper {
+
+    @Insert("insert into post (title, password) values " +
+            "(#{title}, #{password,typeHandler=com.example.mybatis.BoardPasswordTypeHandler})")
+    int insert(Post post);
+
+    @Select("select id, title, password from post where id = #{id}")
+    @Results({
+        @Result(column = "password", property = "password",
+                typeHandler = com.example.mybatis.BoardPasswordTypeHandler.class)
+    })
+    Post findById(Long id);
+}
+```
+
+이제 `Post.password`는 항상 평문입니다 - `PostService`는 저장 전에 암호화를, 조회 후에 복호화를 신경 쓸 필요가 없습니다:
+
+```java
+@Service
+public class PostService {
+    private final PostMapper postMapper;
+
+    public Long save(String title, String password) {
+        Post post = new Post(title, password); // 평문 그대로 넘김 - insert의 typeHandler가 암호화
+        postMapper.insert(post);
+        return post.getId();
+    }
+
+    public String getPassword(Long id) {
+        return postMapper.findById(id).getPassword(); // 이미 복호화된 평문
+    }
+}
+```
+
+#### 3-3. 주의: 레거시/비정형 데이터가 섞인 컬럼에는 읽기 경로에 걸지 말 것
+
+이 컬럼이 항상 이 라이브러리의 봉투 포맷이라는 보장이 없다면(예: 이 라이브러리 도입 이전 데이터가 섞여 있는 컬럼), `@Results`로 읽기 경로에 TypeHandler를 걸면 그 데이터를 스치는 **모든** `SELECT`가 `CryptoException`으로 깨집니다 - 의도적으로 비밀번호를 확인할 때만 복호화를 시도하던 기존 방식과 달리, 목록 조회 같은 일반적인 읽기까지 예외를 던지게 됩니다. 이런 컬럼은 **쓰기 경로(`#{...,typeHandler=...}`)에만** TypeHandler를 걸고, `@Select`는 평문 매핑 없이 암호문 그대로 반환하도록 두는 편이 안전합니다 - 복호화가 필요한 지점(비밀번호 확인 등)에서는 지금처럼 `EnvelopeCryptoService.validate()`/`decrypt()`를 명시적으로 호출하면 됩니다. 새로 시작하는 테이블/컬럼이라 이런 걱정이 없다면 읽기·쓰기 양쪽에 다 걸어도 무방합니다.
+
+---
+
+### 4. 암호화된 컬럼 검색 — Blind Index
+
+AES-GCM은 매번 랜덤 IV를 쓰므로 같은 평문도 암호문이 매번 달라집니다 - `WHERE phone = ?`처럼 암호문 컬럼을 직접 검색할 방법이 없다는 뜻입니다. Blind Index는 이 문제를 푸는 표준적인 방법으로, 평문에 대해 **키가 고정된 결정적 HMAC**을 계산해 암호화된 컬럼 옆에 별도 컬럼으로 저장해 두고, 검색할 때는 같은 방식으로 검색어의 HMAC을 계산해 그 컬럼을 `=`로 조회합니다. **정확히 일치하는 경우만** 찾을 수 있고(LIKE 부분 검색 불가), 컬럼 하나당 별도의 키를 씁니다(도메인/DEK와는 무관 - DEK 로테이션이 blind index 값에 영향을 주지 않고, 그 반대도 마찬가지).
+
+#### 4-1. Config — 필드별 BlindIndexService 빈 구성
+
+```java
+import com.xaan.vault.crypto.blindindex.*;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.vault.core.VaultOperations;
+
+@Configuration
+public class BlindIndexConfig {
+
+    @Bean
+    public BlindIndexKeyProvider blindIndexKeyProvider(
+            VaultOperations vaultOperations,
+            @Value("${vault.blind-index.base-path}") String basePath) {
+        return new VaultBlindIndexKeyProvider(vaultOperations, basePath);
+    }
+
+    // 필드마다 빈을 하나씩 둔다 - indexName은 필드마다 고유한 문자열 키.
+    @Bean
+    public BlindIndexService phoneBlindIndexService(BlindIndexKeyProvider provider) {
+        return BlindIndexService.forIndex("user-phone", provider);
+    }
+
+    @Bean
+    public BlindIndexService rrnBlindIndexService(BlindIndexKeyProvider provider) {
+        return BlindIndexService.forIndex("user-rrn", provider);
+    }
+}
+```
+
+Vault에는 KEK/DEK와 마찬가지로 KV-v2 시크릿 하나에 `key` 필드로 저장합니다(버전 관리는 하지 않음 - 위 설명대로 blind index 키 교체는 전체 재인덱싱이 필요한 별도 작업이라 KEK/DEK식 점진적 로테이션 대상이 아닙니다):
+
+```bash
+vault kv put -mount=ebiz_service ebiz_db/blind-index/user-phone \
+  key="<Base64URL 인코딩된 32바이트 랜덤 키>"
+
+vault kv put -mount=ebiz_service ebiz_db/blind-index/user-rrn \
+  key="<Base64URL 인코딩된 32바이트 랜덤 키>"
+```
+
+#### 4-2. 저장 시 — 암호화 값과 blind index를 함께 저장
+
+```java
+@Service
+public class UserService {
+    private final BlindIndexService phoneBlindIndexService;
+
+    public void register(String phone) {
+        user.setPhone(phone);                                          // typeHandler가 암호화해 저장
+        user.setPhoneBlindIndex(phoneBlindIndexService.compute(phone)); // 검색용 HMAC, 평문 컬럼
+        userMapper.insert(user);
+    }
+}
+```
+
+#### 4-3. 검색 시 — 검색어의 blind index로 조회
+
+```java
+public List<User> searchByPhone(String phone) {
+    String blindIndex = phoneBlindIndexService.compute(phone);
+    return userMapper.findByPhoneBlindIndex(blindIndex); // WHERE phone_blind_idx = #{blindIndex}
+}
+```
+
+정규화(하이픈 제거 등)는 저장 시점과 검색 시점에 **반드시 동일하게** 적용해야 합니다 - 다르게 정규화하면 같은 번호인데도 blind index가 달라져 조용히 매칭에 실패합니다. `BlindIndexService.compute()`는 정규화를 하지 않으므로, 호출 전에 애플리케이션에서 일관되게 처리해야 합니다.
+
+---
+
 ### DEK 로테이션
 
 ```java
@@ -596,6 +742,26 @@ kekVersion(1B) | IV(12B) | Ciphertext(32 bytes, DEK 자체) | GCM Auth Tag(16 by
 
 - **kekVersion**: 이 DEK를 wrap한 KEK 버전 — KEK 로테이션 후에도 옛 버전 KEK로 wrap된 DEK를 계속 unwrap하기 위한 정보. 별도의 Vault 필드가 아니라 wrapped 바이트 자체에 포함되어 있어(self-describing), `WrappedDek`/`DekProvider`는 이 값을 알 필요가 없음
 
+### BlindIndexService / BlindIndexKeyProvider
+
+| 타입/메서드 | 설명 |
+|------|------|
+| `BlindIndexService.forIndex(String indexName, BlindIndexKeyProvider)` | 지정한 인덱스 이름의 키를 로드해 서비스를 구성 |
+| `BlindIndexService.withKey(byte[])` | 테스트 등 provider 없이 키를 직접 주입 |
+| `compute(String plainText)` | HMAC-SHA256으로 결정적 인덱스 값 계산 (Base64 URL-safe). 정규화는 호출 전 애플리케이션 책임 |
+| `BlindIndexKeyProvider` | 인덱스 이름별 HMAC 키 저장소 인터페이스 (`loadKey`, `storeKey`) - DEK와 달리 버전 없음 |
+| `VaultBlindIndexKeyProvider` | Vault KV-v2 기반 구현체, `{basePath}/{indexName}`의 `key` 필드에 저장 |
+
+### EnvelopeCryptoTypeHandler (MyBatis)
+
+| 항목 | 설명 |
+|------|------|
+| 패키지 | `com.xaan.vault.crypto.mybatis` |
+| 상속 | `org.apache.ibatis.type.BaseTypeHandler<String>` (`mybatis` 의존성은 `compileOnly` - MyBatis 미사용 프로젝트엔 강제되지 않음) |
+| 사용법 | 도메인별 `EnvelopeCryptoService`를 주입받는 서브클래스를 만들어 Mapper의 `#{prop,typeHandler=...}`/`@Result(typeHandler=...)`에서 참조 |
+| 동작 | `setNonNullParameter`에서 `encrypt()`, `getNullableResult`에서 `decrypt()` - `null`/빈 문자열은 그대로 통과 |
+| 주의 | 레거시/비정형 데이터가 섞인 컬럼의 읽기 경로에 걸면 그 데이터를 스치는 모든 `SELECT`가 `CryptoException`으로 깨짐 - [3. MyBatis 프로젝트에서 최소 변경으로 통합](#3-mybatis-프로젝트에서-최소-변경으로-통합--envelopecryptotypehandler) 참고 |
+
 ### 예외 클래스
 
 | 예외 | 부모 클래스 | 발생 시점 |
@@ -664,6 +830,16 @@ CryptoException: Envelope domain mismatch: expected ... but got ...
 - 암호문이 이 라이브러리의 봉투 포맷이 아님(예: 다른 방식으로 암호화된 값)
 
 ## Release History
+
+### v0.0.9 (2026-08-26)
+
+**Blind Index + MyBatis TypeHandler 지원 추가** — Spring Boot + MyBatis 프로젝트에서 최소한의 코드 변경으로 컬럼 암호화를 적용하고, 암호화된 컬럼을 검색할 수 있도록 하는 두 가지 독립적인 기능.
+
+**Changes:**
+- `com.xaan.vault.crypto.mybatis.EnvelopeCryptoTypeHandler` 추가 (`BaseTypeHandler<String>` 상속) - Mapper 컬럼에 붙이면 Service 계층의 명시적 `encrypt()`/`decrypt()` 호출 없이 JDBC 파라미터/`ResultSet` 경계에서 투명하게 암/복호화됨. `mybatis`는 `compileOnly` 의존성으로 추가해 MyBatis를 쓰지 않는 소비 프로젝트에는 강제되지 않음(런타임에는 이미 MyBatis를 쓰는 프로젝트의 클래스패스에 있는 것을 그대로 사용)
+- `com.xaan.vault.crypto.blindindex` 패키지 추가: `BlindIndexService`(HMAC-SHA256 기반 결정적 인덱스 계산), `BlindIndexKeyProvider`/`VaultBlindIndexKeyProvider`(필드별 키 저장, Vault KV-v2). AES-GCM 암호문은 검색이 불가능하므로(매번 랜덤 IV), 정확히 일치하는 값을 찾아야 하는 컬럼(전화번호, 주민등록번호 등)에 별도 컬럼으로 나란히 저장해 `WHERE blind_idx = ?`로 조회하는 용도. DEK/KEK와 무관한 별도 키 - 로테이션은 지원하지 않고(전체 재인덱싱이 필요한 별도 작업), 필드마다 키를 분리해 한 필드의 키 교체/유출이 다른 필드에 영향을 주지 않게 함
+- `EnvelopeCryptoTypeHandlerTest`는 실제 H2 인메모리 JDBC 커넥션으로 검증(Mock이 아님) - Mapper가 실제로 보게 될 것과 동일하게, 원본 컬럼에는 암호문이 저장되고 핸들러를 통해 읽으면 평문이 복원되는지 확인
+- 기능 변경 없음, 순수 추가(non-breaking)
 
 ### v0.0.8 (2026-08-21)
 
