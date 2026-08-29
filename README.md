@@ -101,7 +101,7 @@ export PATH=$JAVA_HOME/bin:$PATH
 ./gradlew clean build publishToMavenLocal
 ```
 
-빌드된 JAR는 `~/.m2/repository/com/xaan/vault-crypto/0.0.8/`에 설치됩니다.
+빌드된 JAR는 `~/.m2/repository/com/xaan/vault-crypto/0.0.10/`에 설치됩니다.
 
 ## 의존성 추가
 
@@ -124,7 +124,7 @@ repositories {
 
 dependencies {
     // vault-crypto 라이브러리
-    implementation 'com.xaan:vault-crypto:0.0.8'
+    implementation 'com.xaan:vault-crypto:0.0.10'
 
     // Spring Cloud Vault (필수 의존성)
     implementation 'org.springframework.cloud:spring-cloud-starter-vault-config'
@@ -143,7 +143,7 @@ dependencyManagement {
 <dependency>
     <groupId>com.xaan</groupId>
     <artifactId>vault-crypto</artifactId>
-    <version>0.0.8</version>
+    <version>0.0.10</version>
 </dependency>
 ```
 
@@ -759,7 +759,7 @@ kekVersion(1B) | IV(12B) | Ciphertext(32 bytes, DEK 자체) | GCM Auth Tag(16 by
 | 패키지 | `com.xaan.vault.crypto.mybatis` |
 | 상속 | `org.apache.ibatis.type.BaseTypeHandler<String>` (`mybatis` 의존성은 `compileOnly` - MyBatis 미사용 프로젝트엔 강제되지 않음) |
 | 사용법 | 도메인별 `EnvelopeCryptoService`를 주입받는 서브클래스를 만들어 Mapper의 `#{prop,typeHandler=...}`/`@Result(typeHandler=...)`에서 참조 |
-| 동작 | `setNonNullParameter`에서 `encrypt()`, `getNullableResult`에서 `decrypt()` - `null`/빈 문자열은 그대로 통과 |
+| 동작 | `setParameter`에서 `encrypt()`, `getResult`에서 `decrypt()` - `null`/빈 문자열은 그대로 통과 |
 | 주의 | 레거시/비정형 데이터가 섞인 컬럼의 읽기 경로에 걸면 그 데이터를 스치는 모든 `SELECT`가 `CryptoException`으로 깨짐 - [3. MyBatis 프로젝트에서 최소 변경으로 통합](#3-mybatis-프로젝트에서-최소-변경으로-통합--envelopecryptotypehandler) 참고 |
 
 ### 예외 클래스
@@ -830,6 +830,18 @@ CryptoException: Envelope domain mismatch: expected ... but got ...
 - 암호문이 이 라이브러리의 봉투 포맷이 아님(예: 다른 방식으로 암호화된 값)
 
 ## Release History
+
+### v0.0.10 (2026-08-29) — critical fix for v0.0.9
+
+**`EnvelopeCryptoTypeHandler` was silently encrypting every unrelated `String` column in the application, not just the one it was assigned to.** Found in demoApp right after v0.0.9 went live: a user registration threw `value too long for type character varying(50)` on the `user_id` column - the plain `#{userId}` parameter (no `typeHandler=` attribute at all) had been AES-GCM encrypted, turning a 10-character id into a ~54-character ciphertext. The same thing was silently happening to any other untouched `String` column/parameter across the app - e.g. `board.title`/`content`/`author` in demoApp - without necessarily erroring, meaning data could have been getting corrupted (wrongly encrypted) with no visible failure wherever the ciphertext happened to still fit its column.
+
+**Root cause:** `EnvelopeCryptoTypeHandler` extended MyBatis's `BaseTypeHandler<T>`, which itself extends `TypeReference<T>`. Spring Boot's MyBatis auto-configuration registers every `TypeHandler` bean in the application context via `TypeHandlerRegistry.register(TypeHandler<?>)` - and that method, when it can't find an explicit `@MappedTypes` annotation, falls back to auto-discovering the mapped type via `TypeReference.getRawType()` (a MyBatis 3.1.0+ convenience feature). Since `BaseTypeHandler<String>` always resolves that to `String.class`, the handler got registered as *the* default handler for the entire `String` type - not scoped to the one column it was written for. Removing `@MappedTypes` (the fix attempted when this was first written) does nothing to prevent this, since the `TypeReference` auto-discovery path runs independently of that annotation.
+
+**Fix:** `EnvelopeCryptoTypeHandler` now implements the bare `TypeHandler<String>` interface directly instead of extending `BaseTypeHandler<String>` - no `TypeReference`, so the auto-discovery branch never triggers, and `TypeHandlerRegistry.register(...)` falls through to registering the handler only by its own class (reachable solely via explicit `typeHandler=` references, exactly as intended). Method names changed accordingly: `setNonNullParameter(...)` → `setParameter(...)` (now also responsible for the `null` check `BaseTypeHandler` used to do for you), `getNullableResult(...)` → `getResult(...)`.
+
+**Added a regression test** (`registeringTheHandlerDoesNotMakeItTheDefaultHandlerForString`) that registers the handler into a real `TypeHandlerRegistry` the same way Spring Boot's auto-configuration does, and asserts `getTypeHandler(String.class)` still returns MyBatis's built-in handler, not this one - while `getMappingTypeHandler(TestTypeHandler.class)` does return it, confirming explicit-reference lookup still works.
+
+**Migration**: if you're on v0.0.9 and have any subclass calling the old method names, rename `setNonNullParameter` → `setParameter` and `getNullableResult` → `getResult`. No SQL/schema changes needed. **If v0.0.9 was ever deployed with live traffic, audit for silently-encrypted plain `String` columns** - anything that went through a `#{...}` parameter or `@Select` result column with no explicit `typeHandler=`, in any mapper, while a `TypeHandler` bean from this library was registered in the same `SqlSessionFactory`.
 
 ### v0.0.9 (2026-08-26)
 

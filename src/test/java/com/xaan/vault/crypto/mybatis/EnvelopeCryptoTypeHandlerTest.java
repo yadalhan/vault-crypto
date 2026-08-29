@@ -5,6 +5,7 @@ import com.xaan.vault.crypto.envelope.EnvelopeCryptoService;
 import com.xaan.vault.crypto.envelope.KekService;
 import com.xaan.vault.crypto.envelope.WrappedDek;
 import org.apache.ibatis.type.JdbcType;
+import org.apache.ibatis.type.TypeHandlerRegistry;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -58,7 +59,7 @@ class EnvelopeCryptoTypeHandlerTest {
     void writingThroughTheHandlerStoresCiphertextNotPlaintext() throws Exception {
         try (PreparedStatement ps = connection.prepareStatement("INSERT INTO secrets (id, secret_value) VALUES (?, ?)")) {
             ps.setInt(1, 1);
-            handler.setNonNullParameter(ps, 2, "s3cret-password", JdbcType.VARCHAR);
+            handler.setParameter(ps, 2, "s3cret-password", JdbcType.VARCHAR);
             ps.executeUpdate();
         }
 
@@ -74,14 +75,14 @@ class EnvelopeCryptoTypeHandlerTest {
     void readingThroughTheHandlerRecoversTheOriginalPlaintext() throws Exception {
         try (PreparedStatement ps = connection.prepareStatement("INSERT INTO secrets (id, secret_value) VALUES (?, ?)")) {
             ps.setInt(1, 2);
-            handler.setNonNullParameter(ps, 2, "another-secret", JdbcType.VARCHAR);
+            handler.setParameter(ps, 2, "another-secret", JdbcType.VARCHAR);
             ps.executeUpdate();
         }
 
         try (PreparedStatement ps = connection.prepareStatement("SELECT secret_value FROM secrets WHERE id = 2");
              ResultSet rs = ps.executeQuery()) {
             rs.next();
-            assertEquals("another-secret", handler.getNullableResult(rs, "secret_value"));
+            assertEquals("another-secret", handler.getResult(rs, "secret_value"));
         }
     }
 
@@ -96,7 +97,7 @@ class EnvelopeCryptoTypeHandlerTest {
         try (PreparedStatement ps = connection.prepareStatement("SELECT secret_value FROM secrets WHERE id = 3");
              ResultSet rs = ps.executeQuery()) {
             rs.next();
-            assertNull(handler.getNullableResult(rs, "secret_value"));
+            assertNull(handler.getResult(rs, "secret_value"));
         }
     }
 
@@ -104,7 +105,7 @@ class EnvelopeCryptoTypeHandlerTest {
     void emptyStringIsStoredAsEmptyNotAsCiphertext() throws Exception {
         try (PreparedStatement ps = connection.prepareStatement("INSERT INTO secrets (id, secret_value) VALUES (?, ?)")) {
             ps.setInt(1, 4);
-            handler.setNonNullParameter(ps, 2, "", JdbcType.VARCHAR);
+            handler.setParameter(ps, 2, "", JdbcType.VARCHAR);
             ps.executeUpdate();
         }
 
@@ -112,8 +113,31 @@ class EnvelopeCryptoTypeHandlerTest {
              ResultSet rs = ps.executeQuery()) {
             rs.next();
             assertEquals("", rs.getString("secret_value"));
-            assertEquals("", handler.getNullableResult(rs, "secret_value"));
+            assertEquals("", handler.getResult(rs, "secret_value"));
         }
+    }
+
+    /**
+     * Regression test for the exact bug that shipped once: registering this handler the
+     * same way Spring Boot's MyBatis auto-configuration does ({@code TypeHandlerRegistry
+     * .register(TypeHandler)}, applied to every {@code TypeHandler} bean found in the
+     * context) must NOT make it MyBatis's default handler for every plain {@code String}
+     * column - only for columns that reference it explicitly by class. A
+     * {@code BaseTypeHandler}-based version of this class silently became the app-wide
+     * default String handler (via TypeReference auto-discovery) and started encrypting
+     * unrelated columns like a username or post title that had no {@code typeHandler=}
+     * attribute at all.
+     */
+    @Test
+    void registeringTheHandlerDoesNotMakeItTheDefaultHandlerForString() {
+        TypeHandlerRegistry registry = new TypeHandlerRegistry();
+
+        registry.register(handler);
+
+        // MyBatis always has a built-in default handler for String - the point is that
+        // registering ours must not replace it.
+        assertNotEquals(handler, registry.getTypeHandler(String.class));
+        assertEquals(handler, registry.getMappingTypeHandler(TestTypeHandler.class));
     }
 
     private static byte[] randomBytes(int length) {

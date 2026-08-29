@@ -1,8 +1,8 @@
 package com.xaan.vault.crypto.mybatis;
 
 import com.xaan.vault.crypto.envelope.EnvelopeCryptoService;
-import org.apache.ibatis.type.BaseTypeHandler;
 import org.apache.ibatis.type.JdbcType;
+import org.apache.ibatis.type.TypeHandler;
 
 import java.sql.CallableStatement;
 import java.sql.PreparedStatement;
@@ -32,17 +32,30 @@ import java.sql.SQLException;
  * }
  * }</pre>
  *
+ * <p>Implements {@link TypeHandler} directly rather than extending MyBatis's usual
+ * {@code BaseTypeHandler} - deliberately. {@code BaseTypeHandler<T>} also extends
+ * {@code TypeReference<T>}, which MyBatis's {@code TypeHandlerRegistry.register(TypeHandler)}
+ * uses to auto-discover a handler's mapped Java type when no {@code @MappedTypes} is
+ * present. Since Spring Boot's MyBatis auto-configuration registers every
+ * {@code TypeHandler} bean this way, a {@code BaseTypeHandler<String>} subclass would get
+ * silently auto-registered as the *default* handler for every plain {@code String}
+ * column/parameter in the whole application - not just the one column it's meant for -
+ * encrypting things like a username or post title that never had an explicit
+ * {@code typeHandler=} attribute. Implementing the bare {@link TypeHandler} interface
+ * instead (no {@code TypeReference}) makes that auto-discovery a no-op, so this handler
+ * is only ever used where a mapper names it explicitly.
+ *
  * <p><b>Only use this on a column that is always in this library's envelope format.</b>
  * A read that hits a row predating envelope encryption, or written by something else
- * entirely, throws {@code CryptoException} out of {@code getNullableResult(...)} -
- * which will surface on every query that touches the row, not just a deliberate
- * password-check call. For a column where legacy/foreign data might still be present,
- * keep decrypting explicitly and selectively via {@link EnvelopeCryptoService} in
- * application code instead of wiring this handler onto the read path (it's still fine
- * to use it write-side only, on just the {@code #{...}} parameter in `@Insert`/`@Update`,
- * leaving `@Select` queries returning the column as a plain, undecrypted `String`).
+ * entirely, throws {@code CryptoException} out of {@code getResult(...)} - which will
+ * surface on every query that touches the row, not just a deliberate password-check
+ * call. For a column where legacy/foreign data might still be present, keep decrypting
+ * explicitly and selectively via {@link EnvelopeCryptoService} in application code
+ * instead of wiring this handler onto the read path (it's still fine to use it
+ * write-side only, on just the {@code #{...}} parameter in `@Insert`/`@Update`, leaving
+ * `@Select` queries returning the column as a plain, undecrypted `String`).
  */
-public abstract class EnvelopeCryptoTypeHandler extends BaseTypeHandler<String> {
+public abstract class EnvelopeCryptoTypeHandler implements TypeHandler<String> {
 
     private final EnvelopeCryptoService cryptoService;
 
@@ -51,27 +64,29 @@ public abstract class EnvelopeCryptoTypeHandler extends BaseTypeHandler<String> 
     }
 
     @Override
-    public void setNonNullParameter(PreparedStatement ps, int i, String parameter, JdbcType jdbcType) throws SQLException {
+    public void setParameter(PreparedStatement ps, int i, String parameter, JdbcType jdbcType) throws SQLException {
+        if (parameter == null) {
+            ps.setString(i, null);
+            return;
+        }
         // Empty string is treated the same as null (encrypting "" would turn "no value" into
         // non-empty ciphertext, which breaks any `value != null && !value.isEmpty()`-style
         // check elsewhere in the application - e.g. "is this row password-protected at all").
-        // BaseTypeHandler only special-cases true null before calling this method, so the
-        // empty-string case has to be handled here to stay symmetric with getNullableResult().
         ps.setString(i, parameter.isEmpty() ? parameter : cryptoService.encrypt(parameter));
     }
 
     @Override
-    public String getNullableResult(ResultSet rs, String columnName) throws SQLException {
+    public String getResult(ResultSet rs, String columnName) throws SQLException {
         return decryptIfPresent(rs.getString(columnName));
     }
 
     @Override
-    public String getNullableResult(ResultSet rs, int columnIndex) throws SQLException {
+    public String getResult(ResultSet rs, int columnIndex) throws SQLException {
         return decryptIfPresent(rs.getString(columnIndex));
     }
 
     @Override
-    public String getNullableResult(CallableStatement cs, int columnIndex) throws SQLException {
+    public String getResult(CallableStatement cs, int columnIndex) throws SQLException {
         return decryptIfPresent(cs.getString(columnIndex));
     }
 
