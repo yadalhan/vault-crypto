@@ -69,7 +69,9 @@ vault-crypto/
 │       └── EnvelopeCryptoTypeHandler.java # MyBatis TypeHandler - 컬럼 단위 투명 암/복호화
 ├── build.gradle                   # Gradle 빌드 설정
 ├── settings.gradle                # 프로젝트 설정
-└── README.md
+├── README.md
+├── VAULT_CRYPTO_DEV_GUIDE.md      # Spring Boot+MyBatis+Redis 환경 종합 개발 가이드 (demoApp users 테이블 예제)
+└── VAULT_CRYPTO_DEV_GUIDE.pptx    # 위 가이드를 슬라이드로 정리한 발표 자료
 ```
 
 ## 요구사항
@@ -215,6 +217,8 @@ vault-crypto는 성격이 다른 두 종류의 암호화를 제공합니다. 다
 | 저장 형식 예 | `$2a$10$N9qo8uLOickgx2ZMRZoMy...` | `AQHx9F3...`(Base64, `domainCode+keyVersion+IV+ciphertext+tag`) |
 
 아래에서 각각을 Spring Boot 프로젝트에 통합하는 전체 예제(Config → Service → Controller → curl 호출까지)를 다룹니다.
+
+> **더 실전에 가까운 종합 가이드가 필요하다면**: [`VAULT_CRYPTO_DEV_GUIDE.md`](VAULT_CRYPTO_DEV_GUIDE.md) - Spring Boot + MyBatis + Redis 환경에서 이 라이브러리로 DB 컬럼 암호화를 처음부터 구축하는 절차를 다룹니다. 양방향/단방향 컬럼을 모두 가진 실제 테이블(demoApp의 `users`)을 예제로, 의존성·Vault 설정부터 CRUD, Blind Index 검색, 단방향 컬럼 조회, Redis 캐싱(self-invocation 함정 포함), Vault 없는 단위 테스트 작성법까지 정리했습니다. 같은 내용을 발표 자료로 정리한 [`VAULT_CRYPTO_DEV_GUIDE.pptx`](VAULT_CRYPTO_DEV_GUIDE.pptx)도 있습니다.
 
 ---
 
