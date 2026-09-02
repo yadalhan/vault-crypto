@@ -216,7 +216,7 @@ vault-crypto는 성격이 다른 두 종류의 암호화를 제공합니다. 다
 | Vault 의존성 | 없음 | 있음 (앱 기동 시 1회 로드, 이후 요청은 로컬에서만 처리) |
 | 저장 형식 예 | `$2a$10$N9qo8uLOickgx2ZMRZoMy...` | `AQHx9F3...`(Base64, `domainCode+keyVersion+IV+ciphertext+tag`) |
 
-아래에서 각각을 Spring Boot 프로젝트에 통합하는 전체 예제(Config → Service → Controller → curl 호출까지)를 다룹니다.
+vault-crypto 자체는 JPA/MyBatis 어느 쪽에도 의존하지 않습니다 — `EnvelopeCryptoService`/`PasswordHasher`는 순수 Java 객체를 encrypt/decrypt/hash할 뿐이고, 영속성 계층과 어떻게 엮을지는 소비 프로젝트가 정합니다. 아래 1·2절은 두 방식 공통이고, 3절(JPA)·4절(MyBatis)에서 각 영속성 기술에 실제로 통합하는 방법을 다룹니다.
 
 > **더 실전에 가까운 종합 가이드가 필요하다면**: [`VAULT_CRYPTO_DEV_GUIDE.md`](VAULT_CRYPTO_DEV_GUIDE.md) - Spring Boot + MyBatis + Redis 환경에서 이 라이브러리로 DB 컬럼 암호화를 처음부터 구축하는 절차를 다룹니다. 양방향/단방향 컬럼을 모두 가진 실제 테이블(demoApp의 `users`)을 예제로, 의존성·Vault 설정부터 CRUD, Blind Index 검색, 단방향 컬럼 조회, Redis 캐싱(self-invocation 함정 포함), Vault 없는 단위 테스트 작성법까지 정리했습니다. 같은 내용을 발표 자료로 정리한 [`VAULT_CRYPTO_DEV_GUIDE.pptx`](VAULT_CRYPTO_DEV_GUIDE.pptx)도 있습니다.
 
@@ -224,99 +224,61 @@ vault-crypto는 성격이 다른 두 종류의 암호화를 제공합니다. 다
 
 ### 1. 단방향 암호화 — BCrypt로 로그인 비밀번호 다루기
 
-"맞는지 검증"만 하면 되고 원문 복구가 필요 없는 값(로그인 비밀번호)은 `PasswordHasher`를 씁니다. BCrypt는 솔트를 자체 생성해 결과 문자열에 내장하므로 외부 키가 필요 없고, 따라서 Vault 설정이나 KEK/DEK 부트스트랩 없이 바로 쓸 수 있습니다.
-
-#### 1-1. Service
+"맞는지 검증"만 하면 되고 원문 복구가 필요 없는 값(로그인 비밀번호)은 `PasswordHasher`를 씁니다. BCrypt는 솔트를 자체 생성해 결과 문자열에 내장하므로 외부 키가 필요 없고, 따라서 Vault 설정이나 KEK/DEK 부트스트랩 없이 바로 쓸 수 있습니다. 결과가 그냥 `String` 컬럼 하나이므로 JPA 엔티티 필드든 MyBatis Mapper 파라미터든 동일하게 다루면 됩니다 — 아래는 vault-crypto를 그대로 감싸는 얇은 서비스 예제입니다:
 
 ```java
 import com.xaan.vault.crypto.PasswordHasher;
 import org.springframework.stereotype.Service;
 
 @Service
-public class UserService {
+public class PasswordService {
 
     private final PasswordHasher passwordHasher = new PasswordHasher();
-    private final UserRepository userRepository;
 
-    public UserService(UserRepository userRepository) {
-        this.userRepository = userRepository;
+    public String hashUserPassword(String rawPassword) {
+        return passwordHasher.hash(rawPassword); // 매 호출마다 다른 솔트 -> 다른 결과 문자열
     }
 
-    public Long register(String userId, String rawPassword) {
-        String hashed = passwordHasher.hash(rawPassword); // 매 호출마다 다른 솔트 -> 다른 결과 문자열
-        User user = new User(userId, hashed);
-        return userRepository.save(user).getId();
-    }
-
-    public boolean login(String userId, String rawPassword) {
-        return userRepository.findByUserId(userId)
-                .map(user -> passwordHasher.matches(rawPassword, user.getPassword()))
-                .orElse(false);
+    public boolean validateUserPassword(String rawPassword, String hashedPassword) {
+        return passwordHasher.matches(rawPassword, hashedPassword);
     }
 }
 ```
 
-#### 1-2. Controller
+가입/로그인 흐름에서는 영속성 기술과 무관하게 이 두 메서드만 호출하면 됩니다(demoApp의 실제 코드 — `PasswordService.hashUserPassword`/`validateUserPassword`, MyBatis 기반):
 
 ```java
-@RestController
-@RequestMapping("/api/users")
-public class UserController {
+// 가입 - 비밀번호는 해시로 변환한 뒤에만 저장 대상 엔티티/객체에 담는다
+String hashedPassword = passwordService.hashUserPassword(dto.getPassword());
+User user = User.builder()
+        .userId(dto.getUserId())
+        .password(hashedPassword)
+        // ...
+        .build();
+userMapper.insert(user); // 또는 JPA라면 userRepository.save(user)
 
-    private final UserService userService;
-
-    public UserController(UserService userService) { this.userService = userService; }
-
-    @PostMapping("/register")
-    public ResponseEntity<Long> register(@RequestBody RegisterRequest req) {
-        return ResponseEntity.ok(userService.register(req.userId(), req.password()));
-    }
-
-    @PostMapping("/login")
-    public ResponseEntity<String> login(@RequestBody LoginRequest req) {
-        return userService.login(req.userId(), req.password())
-                ? ResponseEntity.ok("로그인 성공")
-                : ResponseEntity.status(401).body("아이디 또는 비밀번호가 일치하지 않습니다");
-    }
-
-    public record RegisterRequest(String userId, String password) {}
-    public record LoginRequest(String userId, String password) {}
+// 로그인 - 저장된 해시와 비교만 한다. id_no/phone 같은 PII 컬럼은 로그인에 필요 없으므로
+// 애초에 조회조차 하지 않는다(불필요한 컬럼을 복호화 경로에 태우지 않기 위해).
+public boolean validateLogin(String userId, String rawPassword) {
+    Optional<User> userOpt = userMapper.findAuthByUserId(userId); // password만 있는 전용 조회
+    return userOpt.isPresent() && passwordService.validateUserPassword(rawPassword, userOpt.get().getPassword());
 }
-```
-
-#### 1-3. 호출 예시
-
-```bash
-curl -X POST http://localhost:8080/api/users/register \
-  -H "Content-Type: application/json" \
-  -d '{"userId":"alice","password":"s3cret!"}'
-# -> 1  (신규 사용자 id)
-
-# DB의 users.password 컬럼: $2a$10$N9qo8uLOickgx2ZMRZoMy.MyrCwtGGY0hJIVvZmvHDpXGVKcqOF6O
-#   -> 원문 "s3cret!"은 어디에도 남지 않고, 매번 다른 솔트라 같은 원문을 두 번 해시해도 결과가 다름
-
-curl -X POST http://localhost:8080/api/users/login \
-  -H "Content-Type: application/json" \
-  -d '{"userId":"alice","password":"s3cret!"}'
-# -> 200 OK "로그인 성공"
-
-curl -X POST http://localhost:8080/api/users/login \
-  -H "Content-Type: application/json" \
-  -d '{"userId":"alice","password":"wrong-password"}'
-# -> 401 Unauthorized "아이디 또는 비밀번호가 일치하지 않습니다"
 ```
 
 `decrypt()`에 해당하는 메서드가 아예 없다는 점이 핵심입니다 — DB가 통째로 유출되어도 저장된 해시에서 원문 비밀번호를 복원할 방법이 없습니다.
 
 ---
 
-### 2. 양방향 암호화 — KEK-DEK 봉투 암호화로 게시글 비밀번호/개인정보 다루기
+### 2. 양방향 암호화 — 공통 Config: 도메인별 `EnvelopeCryptoService` 빈 구성
 
-나중에 원문이 다시 필요한 값(게시글 비밀번호 확인 화면, 개인정보 조회 등)은 `EnvelopeCryptoService`를 씁니다. 앞의 [Vault 설정](#vault-설정) 단계(KEK/DEK를 Vault에 저장)가 먼저 끝나 있어야 합니다.
-
-#### 2-1. Config — 도메인별 `EnvelopeCryptoService` 빈 구성
+원문이 나중에 다시 필요한 값(개인정보 조회, 비밀번호 확인 화면 등)은 `EnvelopeCryptoService`를 씁니다. 앞의 [Vault 설정](#vault-설정) 단계(KEK/DEK를 Vault에 저장)가 먼저 끝나 있어야 합니다. 이 Config는 JPA/MyBatis 어느 쪽을 쓰든 완전히 동일합니다 — `EnvelopeCryptoService`는 영속성 계층을 전혀 모르는 순수 암/복호화 빈이기 때문입니다. 아래는 demoApp의 실제 `CryptoConfig`입니다(`board`, `user-pii` 두 도메인 + Blind Index 빈까지 한 곳에서 구성):
 
 ```java
+package com.xaan.demo.config;
+
+import com.xaan.vault.crypto.blindindex.BlindIndexKeyProvider;
+import com.xaan.vault.crypto.blindindex.BlindIndexService;
+import com.xaan.vault.crypto.blindindex.VaultBlindIndexKeyProvider;
 import com.xaan.vault.crypto.envelope.*;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
@@ -326,57 +288,110 @@ import org.springframework.vault.core.VaultOperations;
 @Configuration
 public class CryptoConfig {
 
+    public static final byte BOARD_DOMAIN_CODE = 1;
+    public static final byte USER_PII_DOMAIN_CODE = 2;
+
     @Bean
     public KekProvider kekProvider(
             VaultOperations vaultOperations,
-            @Value("${vault.kek.path}") String kekPath) {
+            @Value("${vault.kek.path:ebiz_service/data/ebiz_db/kek}") String kekPath) {
         return new VaultKekProvider(vaultOperations, kekPath);
     }
 
     @Bean
     public KekService kekService(KekProvider kekProvider) {
-        return KekService.load(kekProvider); // 모든 KEK 버전을 앱 기동 시 1회 로드
+        return KekService.load(kekProvider);
     }
 
     @Bean
     public DekProvider dekProvider(
             VaultOperations vaultOperations,
-            @Value("${vault.dek.base-path}") String dekBasePath) {
+            @Value("${vault.dek.base-path:ebiz_service/data/ebiz_db/dek}") String dekBasePath) {
         return new VaultDekProvider(vaultOperations, dekBasePath);
     }
 
     // 서비스 도메인마다 빈을 하나씩 둔다. domainCode는 도메인마다 고유한 1바이트 값.
     @Bean
-    public EnvelopeCryptoService boardCryptoService(KekService kek, DekProvider dekProvider) {
-        return EnvelopeCryptoService.forDomain((byte) 1, "board", kek, dekProvider);
+    public EnvelopeCryptoService boardCryptoService(KekService kekService, DekProvider dekProvider) {
+        return EnvelopeCryptoService.forDomain(BOARD_DOMAIN_CODE, "board", kekService, dekProvider);
     }
 
     @Bean
-    public EnvelopeCryptoService userPiiCryptoService(KekService kek, DekProvider dekProvider) {
-        return EnvelopeCryptoService.forDomain((byte) 2, "user-pii", kek, dekProvider);
+    public EnvelopeCryptoService userPiiCryptoService(KekService kekService, DekProvider dekProvider) {
+        return EnvelopeCryptoService.forDomain(USER_PII_DOMAIN_CODE, "user-pii", kekService, dekProvider);
+    }
+
+    // 전화번호/주민등록번호 검색용 - 필드마다 독립된 HMAC 키를 쓰므로 도메인 코드 없이 문자열 이름으로 구분
+    @Bean
+    public BlindIndexKeyProvider blindIndexKeyProvider(
+            VaultOperations vaultOperations,
+            @Value("${vault.blind-index.base-path:ebiz_service/data/ebiz_db/blind-index}") String basePath) {
+        return new VaultBlindIndexKeyProvider(vaultOperations, basePath);
+    }
+
+    @Bean
+    public BlindIndexService phoneBlindIndexService(BlindIndexKeyProvider blindIndexKeyProvider) {
+        return BlindIndexService.forIndex("user-phone", blindIndexKeyProvider);
+    }
+
+    @Bean
+    public BlindIndexService rrnBlindIndexService(BlindIndexKeyProvider blindIndexKeyProvider) {
+        return BlindIndexService.forIndex("user-rrn", blindIndexKeyProvider);
     }
 }
 ```
 
-`EnvelopeCryptoService.forDomain(...)`이 호출되는 시점(빈 생성 시, 즉 앱 기동 시)에 KEK로 해당 도메인의 DEK를 1회 unwrap해서 메모리에 캐시합니다. 이후 `encrypt()`/`decrypt()`/`validate()` 호출은 Vault를 다시 호출하지 않습니다.
+`EnvelopeCryptoService.forDomain(...)`이 호출되는 시점(빈 생성 시, 즉 앱 기동 시)에 KEK로 해당 도메인의 DEK를 1회 unwrap해서 메모리에 캐시합니다. 이후 `encrypt()`/`decrypt()`/`validate()` 호출은 Vault를 다시 호출하지 않습니다. 이 빈들을 이제부터 JPA(3절) 또는 MyBatis(4절) 계층에서 그대로 주입받아 씁니다.
 
-#### 2-2. Service — 도메인 간 키 분리 (게시글 비밀번호 vs 개인정보)
+---
+
+### 3. JPA 프로젝트에서 사용하기
+
+> **참고**: 아래 예제는 참고용 가상 예제입니다. demoApp은 과거 Spring Data JPA를 사용하다가 MyBatis 3.5.16으로 완전히 마이그레이션되었고, 현재 코드베이스에는 `@Entity`/`JpaRepository` 등 JPA 관련 코드가 전혀 남아 있지 않습니다(README 변경 이력 참고). 즉 이 절은 demoApp의 실제 코드가 아니라, Spring Data JPA 프로젝트에 vault-crypto를 통합하는 일반적인 패턴을 보여주기 위한 예시입니다. 실제 프로덕션에서 검증된 사례가 필요하면 4절(MyBatis, demoApp `users` 테이블 실제 구현)을 참고하세요.
+
+#### 3-1. Service에서 직접 encrypt/decrypt 호출하기
+
+가장 단순한 방법은 Service 계층에서 `EnvelopeCryptoService`를 직접 호출하고, 엔티티/Repository는 이미 암호화된 문자열을 평범한 컬럼처럼 다루게 하는 것입니다.
+
+```java
+@Entity
+@Table(name = "board")
+public class Post {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    private String title;
+    private String content;
+    private String password; // 항상 암호문 상태로 저장 - 엔티티는 암/복호화를 모른다
+
+    protected Post() {}
+
+    public Post(String title, String content, String encryptedPassword) {
+        this.title = title;
+        this.content = content;
+        this.password = encryptedPassword;
+    }
+
+    public Long getId() { return id; }
+    public String getContent() { return content; }
+    public String getPassword() { return password; }
+}
+
+public interface PostRepository extends JpaRepository<Post, Long> {}
+```
 
 ```java
 @Service
 public class PasswordService {
 
     private final EnvelopeCryptoService boardCryptoService;
-    private final EnvelopeCryptoService userPiiCryptoService;
 
-    public PasswordService(
-            @Qualifier("boardCryptoService") EnvelopeCryptoService boardCryptoService,
-            @Qualifier("userPiiCryptoService") EnvelopeCryptoService userPiiCryptoService) {
+    public PasswordService(@Qualifier("boardCryptoService") EnvelopeCryptoService boardCryptoService) {
         this.boardCryptoService = boardCryptoService;
-        this.userPiiCryptoService = userPiiCryptoService;
     }
 
-    // 게시글 비밀번호 (board 도메인 DEK)
     public String encryptBoardPassword(String password) {
         return boardCryptoService.encrypt(password);
     }
@@ -384,21 +399,8 @@ public class PasswordService {
     public boolean validateBoardPassword(String rawPassword, String encryptedPassword) {
         return boardCryptoService.validate(rawPassword, encryptedPassword);
     }
-
-    // 주민등록번호 등 개인정보 (user-pii 도메인 DEK — board와 별도 키)
-    public String encryptUserPii(String plainText) {
-        return userPiiCryptoService.encrypt(plainText);
-    }
-
-    public String decryptUserPii(String encryptedText) {
-        return userPiiCryptoService.decrypt(encryptedText);
-    }
 }
 ```
-
-`board` DEK로 암호화한 값은 `user-pii` 서비스로 복호화를 시도하면 `domainCode` 불일치로 항상 `CryptoException`이 발생합니다 — 도메인 간 키가 섞이지 않는다는 것을 애플리케이션 레벨에서도 보장합니다.
-
-#### 2-3. Controller — 비밀번호가 걸린 게시글 등록/조회
 
 ```java
 @RestController
@@ -426,7 +428,7 @@ public class PostController {
         if (!passwordService.validateBoardPassword(req.password(), post.getPassword())) {
             return ResponseEntity.status(403).body("비밀번호가 일치하지 않습니다");
         }
-        return ResponseEntity.ok(post.getContent()); // content 컬럼 자체는 암호화 대상이 아님 - 암호화된 건 password 컬럼뿐
+        return ResponseEntity.ok(post.getContent());
     }
 
     public record SaveRequest(String title, String content, String password) {}
@@ -434,135 +436,293 @@ public class PostController {
 }
 ```
 
-#### 2-4. 호출 예시
+단순히 "맞는지"만 확인하면 되는 경우엔 `decrypt()` 대신 `validate()`를 쓰는 편이 낫습니다 — 상수 시간 비교로 Timing Attack을 막아주기 때문입니다.
 
-```bash
-curl -X POST http://localhost:8080/api/posts \
-  -H "Content-Type: application/json" \
-  -d '{"title":"비공개 글","content":"본문 내용","password":"1234"}'
-# -> 5  (신규 게시글 id)
+#### 3-2. `AttributeConverter`로 최소 변경 통합하기
 
-# DB의 board.password 컬럼: AQHZjK3F9pQ2mR8wXeYq7B0vN1sT6uL4c...  (Base64, 매번 다른 값)
-#   -> 같은 "1234"를 다시 암호화해도 IV가 매번 랜덤이라 저장값은 매번 달라짐
-
-curl -X POST http://localhost:8080/api/posts/5/view \
-  -H "Content-Type: application/json" \
-  -d '{"password":"1234"}'
-# -> 200 OK "본문 내용"
-
-curl -X POST http://localhost:8080/api/posts/5/view \
-  -H "Content-Type: application/json" \
-  -d '{"password":"0000"}'
-# -> 403 Forbidden "비밀번호가 일치하지 않습니다"
-```
-
-`encryptBoardPassword()`로 저장한 값은 필요하면 `boardCryptoService.decrypt(encrypted)`로 원문 `"1234"`를 그대로 복원할 수 있습니다 — BCrypt와 달리 되돌리기가 가능하다는 점이 이 방식을 선택하는 이유입니다(예: 관리자가 원문을 확인해야 하는 업무 요건이 있을 때). 단순히 "맞는지"만 확인하면 되는 경우엔 `decrypt()` 대신 `validate()`를 쓰는 편이 낫습니다 — 상수 시간 비교로 Timing Attack을 막아주기 때문입니다.
-
----
-
-### 3. MyBatis 프로젝트에서 최소 변경으로 통합 — EnvelopeCryptoTypeHandler
-
-위 예제들처럼 Service 계층에서 `encrypt()`/`decrypt()`를 직접 호출하는 대신, MyBatis의 `TypeHandler`로 컬럼 단위 암/복호화를 감출 수 있습니다. Mapper의 SQL과 그걸 호출하는 Service 코드는 평문 `String`만 다루면 되고, 실제 암/복호화는 JDBC 파라미터를 세팅하거나 `ResultSet`을 읽는 시점에 투명하게 일어납니다.
-
-#### 3-1. 도메인별 TypeHandler 서브클래스
-
-`EnvelopeCryptoTypeHandler`는 `EnvelopeCryptoService` 하나에 고정된 컬럼 하나를 담당합니다. MyBatis는 `typeHandler=...`를 **클래스**로만 참조할 수 있어서 도메인마다 별도 서브클래스가 필요합니다 — `mybatis-spring-boot-starter`가 Spring 빈으로 등록된 TypeHandler를 인식하므로, 생성자로 원하는 도메인의 `EnvelopeCryptoService`를 주입받게만 만들면 됩니다:
+컬럼 단위로 암/복호화를 숨기고 싶다면 JPA의 `AttributeConverter`를 씁니다 — MyBatis의 `EnvelopeCryptoTypeHandler`(4절)와 동일한 발상이지만, **vault-crypto는 MyBatis용 TypeHandler만 제공**하고 JPA용 Converter는 제공하지 않으므로 소비 프로젝트가 직접 작성해야 합니다:
 
 ```java
-import com.xaan.vault.crypto.mybatis.EnvelopeCryptoTypeHandler;
 import com.xaan.vault.crypto.envelope.EnvelopeCryptoService;
+import jakarta.persistence.AttributeConverter;
+import jakarta.persistence.Converter;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Component;
 
+// EnvelopeCryptoTypeHandler와 동일한 패턴: EnvelopeCryptoService 하나에 고정된 컬럼 하나만 담당하는 얇은 래퍼.
 @Component
-public class BoardPasswordTypeHandler extends EnvelopeCryptoTypeHandler {
-    public BoardPasswordTypeHandler(@Qualifier("boardCryptoService") EnvelopeCryptoService cryptoService) {
-        super(cryptoService);
+@Converter
+public class BoardPasswordConverter implements AttributeConverter<String, String> {
+
+    private final EnvelopeCryptoService boardCryptoService;
+
+    public BoardPasswordConverter(@Qualifier("boardCryptoService") EnvelopeCryptoService boardCryptoService) {
+        this.boardCryptoService = boardCryptoService;
+    }
+
+    @Override
+    public String convertToDatabaseColumn(String plainText) {
+        return plainText == null ? null : boardCryptoService.encrypt(plainText);
+    }
+
+    @Override
+    public String convertToEntityAttribute(String encryptedText) {
+        return encryptedText == null ? null : boardCryptoService.decrypt(encryptedText);
     }
 }
 ```
-
-#### 3-2. Mapper에서 컬럼 단위로 지정
 
 ```java
-@Mapper
-public interface PostMapper {
+@Entity
+@Table(name = "board")
+public class Post {
 
-    @Insert("insert into post (title, password) values " +
-            "(#{title}, #{password,typeHandler=com.example.mybatis.BoardPasswordTypeHandler})")
-    int insert(Post post);
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
 
-    @Select("select id, title, password from post where id = #{id}")
-    @Results({
-        @Result(column = "password", property = "password",
-                typeHandler = com.example.mybatis.BoardPasswordTypeHandler.class)
-    })
-    Post findById(Long id);
+    private String title;
+    private String content;
+
+    @Convert(converter = BoardPasswordConverter.class)
+    private String password; // 엔티티는 항상 평문만 다룬다 - 변환은 컨버터가 전담
+
+    // ...
 }
 ```
 
-이제 `Post.password`는 항상 평문입니다 - `PostService`는 저장 전에 암호화를, 조회 후에 복호화를 신경 쓸 필요가 없습니다:
+두 가지 주의할 점이 있습니다:
 
-```java
-@Service
-public class PostService {
-    private final PostMapper postMapper;
+1. **`@Component`로 Spring 빈으로 등록해야만 생성자로 `EnvelopeCryptoService`를 주입받을 수 있습니다.** JPA가 컨버터를 기본 생성자로 직접 만들면 DI가 불가능합니다 — Spring Boot의 Hibernate 자동 설정이 `hibernate.resource.beans.container`를 `SpringBeanContainer`로 구성해 주는 것에 의존하는데, Spring Boot 2.x 이상에서는 기본으로 활성화되어 있습니다.
+2. **`@Converter(autoApply = true)`는 쓰지 마세요.** 이 라이브러리의 MyBatis `EnvelopeCryptoTypeHandler`가 v0.0.9에서 겪었던 것과 정확히 같은 함정입니다 — `autoApply = true`는 명시적으로 지정하지 않은 모든 `String` 타입 필드에까지 컨버터가 조용히 적용될 수 있습니다(v0.0.10 릴리스 노트 참고). 반드시 `@Convert(converter = ...)`로 필드마다 명시적으로 지정하세요.
 
-    public Long save(String title, String password) {
-        Post post = new Post(title, password); // 평문 그대로 넘김 - insert의 typeHandler가 암호화
-        postMapper.insert(post);
-        return post.getId();
-    }
-
-    public String getPassword(Long id) {
-        return postMapper.findById(id).getPassword(); // 이미 복호화된 평문
-    }
-}
-```
-
-#### 3-3. 주의: 레거시/비정형 데이터가 섞인 컬럼에는 읽기 경로에 걸지 말 것
-
-이 컬럼이 항상 이 라이브러리의 봉투 포맷이라는 보장이 없다면(예: 이 라이브러리 도입 이전 데이터가 섞여 있는 컬럼), `@Results`로 읽기 경로에 TypeHandler를 걸면 그 데이터를 스치는 **모든** `SELECT`가 `CryptoException`으로 깨집니다 - 의도적으로 비밀번호를 확인할 때만 복호화를 시도하던 기존 방식과 달리, 목록 조회 같은 일반적인 읽기까지 예외를 던지게 됩니다. 이런 컬럼은 **쓰기 경로(`#{...,typeHandler=...}`)에만** TypeHandler를 걸고, `@Select`는 평문 매핑 없이 암호문 그대로 반환하도록 두는 편이 안전합니다 - 복호화가 필요한 지점(비밀번호 확인 등)에서는 지금처럼 `EnvelopeCryptoService.validate()`/`decrypt()`를 명시적으로 호출하면 됩니다. 새로 시작하는 테이블/컬럼이라 이런 걱정이 없다면 읽기·쓰기 양쪽에 다 걸어도 무방합니다.
+`PostRepository`/`PostService`/`PostController`는 3-1과 동일하되, 이제 `Post.password`는 (컨버터가 저장/조회 경계에서 암/복호화를 대신 처리하므로) 서비스·컨트롤러 어디서도 평문 그대로 다루면 됩니다.
 
 ---
 
-### 4. 암호화된 컬럼 검색 — Blind Index
+### 4. MyBatis 프로젝트에서 사용하기 (demoApp `users` 테이블 실제 구현)
 
-AES-GCM은 매번 랜덤 IV를 쓰므로 같은 평문도 암호문이 매번 달라집니다 - `WHERE phone = ?`처럼 암호문 컬럼을 직접 검색할 방법이 없다는 뜻입니다. Blind Index는 이 문제를 푸는 표준적인 방법으로, 평문에 대해 **키가 고정된 결정적 HMAC**을 계산해 암호화된 컬럼 옆에 별도 컬럼으로 저장해 두고, 검색할 때는 같은 방식으로 검색어의 HMAC을 계산해 그 컬럼을 `=`로 조회합니다. **정확히 일치하는 경우만** 찾을 수 있고(LIKE 부분 검색 불가), 컬럼 하나당 별도의 키를 씁니다(도메인/DEK와는 무관 - DEK 로테이션이 blind index 값에 영향을 주지 않고, 그 반대도 마찬가지).
+demoApp은 MyBatis 3.5.16(`mybatis-spring-boot-starter`)만 사용합니다. 아래는 `users` 테이블의 주민등록번호(`id_no`)/전화번호(`phone`) 컬럼을 KEK-DEK로 암호화하고, Blind Index로 검색하고, Redis로 캐싱하는 실제 프로덕션 코드입니다.
 
-#### 4-1. Config — 필드별 BlindIndexService 빈 구성
+#### 4-1. 도메인별 `EnvelopeCryptoTypeHandler` 서브클래스
+
+`EnvelopeCryptoTypeHandler`는 `EnvelopeCryptoService` 하나에 고정된 컬럼 하나를 담당합니다. MyBatis는 `typeHandler=...`를 **클래스**로만 참조할 수 있어서 도메인/컬럼마다 별도 서브클래스가 필요합니다 — `mybatis-spring-boot-starter`가 Spring 빈으로 등록된 TypeHandler를 인식하므로, 생성자로 원하는 도메인의 `EnvelopeCryptoService`를 주입받게만 만들면 됩니다:
 
 ```java
-import com.xaan.vault.crypto.blindindex.*;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.vault.core.VaultOperations;
+package com.xaan.demo.config.mybatis;
 
-@Configuration
-public class BlindIndexConfig {
+import com.xaan.vault.crypto.envelope.EnvelopeCryptoService;
+import com.xaan.vault.crypto.mybatis.EnvelopeCryptoTypeHandler;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.stereotype.Component;
 
-    @Bean
-    public BlindIndexKeyProvider blindIndexKeyProvider(
-            VaultOperations vaultOperations,
-            @Value("${vault.blind-index.base-path}") String basePath) {
-        return new VaultBlindIndexKeyProvider(vaultOperations, basePath);
-    }
-
-    // 필드마다 빈을 하나씩 둔다 - indexName은 필드마다 고유한 문자열 키.
-    @Bean
-    public BlindIndexService phoneBlindIndexService(BlindIndexKeyProvider provider) {
-        return BlindIndexService.forIndex("user-phone", provider);
-    }
-
-    @Bean
-    public BlindIndexService rrnBlindIndexService(BlindIndexKeyProvider provider) {
-        return BlindIndexService.forIndex("user-rrn", provider);
+// users.id_no/users.phone을 user-pii 도메인 DEK로 암/복호화한다. users 테이블은 KEK-DEK 도입 시점에
+// 초기화되어 레거시(비-봉투 포맷) 데이터가 없으므로, 아래 BoardPasswordTypeHandler와 달리 읽기 경로에도
+// 안전하게 걸 수 있다.
+@Component
+public class UserPiiTypeHandler extends EnvelopeCryptoTypeHandler {
+    public UserPiiTypeHandler(@Qualifier("userPiiCryptoService") EnvelopeCryptoService userPiiCryptoService) {
+        super(userPiiCryptoService);
     }
 }
 ```
 
-Vault에는 KEK/DEK와 마찬가지로 KV-v2 시크릿 하나에 `key` 필드로 저장합니다(버전 관리는 하지 않음 - 위 설명대로 blind index 키 교체는 전체 재인덱싱이 필요한 별도 작업이라 KEK/DEK식 점진적 로테이션 대상이 아닙니다):
+같은 앱 안에 있는 `BoardPasswordTypeHandler`는 정반대 제약을 가진 대조 사례입니다 — `board` 테이블에는 이 라이브러리 도입 이전의 레거시 포맷 데이터가 약 4.6만 건 섞여 있어, **쓰기 경로에만** 걸립니다(자세한 이유는 4-4절 참고).
+
+#### 4-2. Mapper에서 컬럼 단위로 지정
+
+```java
+package com.xaan.demo.domain.mapper;
+
+@Mapper
+public interface UserMapper {
+
+    String INSERT_COLUMNS = "user_id, password, username, id_no, phone, id_no_blind_idx, phone_blind_idx";
+    String INSERT_VALUES = "#{userId}, #{password}, #{username}, " +
+            "#{residentRegistrationNumber,typeHandler=com.xaan.demo.config.mybatis.UserPiiTypeHandler}, " +
+            "#{phone,typeHandler=com.xaan.demo.config.mybatis.UserPiiTypeHandler}, " +
+            "#{residentRegistrationNumberBlindIndex}, #{phoneBlindIndex}";
+
+    @Insert("insert into users (" + INSERT_COLUMNS + ") values (" + INSERT_VALUES + ")")
+    @Options(useGeneratedKeys = true, keyProperty = "id", keyColumn = "id")
+    int insert(User user);
+
+    // 업무용 조회 - id_no/phone은 UserPiiTypeHandler가 투명하게 복호화해 평문으로 돌려준다.
+    @Select("select id, user_id, password, username, id_no, phone, id_no_blind_idx, phone_blind_idx " +
+            "from users where user_id = #{userId}")
+    @Results({
+            @Result(column = "id_no", property = "residentRegistrationNumber", typeHandler = UserPiiTypeHandler.class),
+            @Result(column = "phone", property = "phone", typeHandler = UserPiiTypeHandler.class),
+            @Result(column = "id_no_blind_idx", property = "residentRegistrationNumberBlindIndex"),
+            @Result(column = "phone_blind_idx", property = "phoneBlindIndex")
+    })
+    Optional<User> findByUserId(String userId);
+
+    // 로그인 검증 전용 - BCrypt 비교에는 password만 있으면 되고 id_no/phone은 필요 없다. 그 컬럼들을 굳이
+    // 복호화하면(findByUserId처럼) PII 쪽 ciphertext 문제 하나가 이 계정의 로그인 자체를 막아버리게 된다.
+    @Select("select id, user_id, password, username from users where user_id = #{userId}")
+    Optional<User> findAuthByUserId(String userId);
+
+    // 목록/검색 조회 - id_no/phone은 일부러 typeHandler 없이 ciphertext 그대로 반환한다. 행이 여러 개인
+    // 조회이므로, 한 행의 ciphertext만 문제가 있어도 findByUserId처럼 typeHandler를 걸었다면 전체 조회가
+    // 예외로 죽어 나머지 정상 행까지 볼 수 없게 된다. 복호화는 UserService.search()가 행별로 개별 시도한다.
+    @Select("""
+            <script>
+            select id, user_id, password, username, id_no, phone, id_no_blind_idx, phone_blind_idx
+            from users
+            <where>
+                <if test="name != null and name != ''">and username like concat('%', #{name}, '%')</if>
+                <if test="phoneBlindIndex != null and phoneBlindIndex != ''">and phone_blind_idx = #{phoneBlindIndex}</if>
+                <if test="rrnBlindIndex != null and rrnBlindIndex != ''">and id_no_blind_idx = #{rrnBlindIndex}</if>
+            </where>
+            order by id desc
+            </script>
+            """)
+    @Results({
+            @Result(column = "id_no", property = "residentRegistrationNumber"),
+            @Result(column = "phone", property = "phone"),
+            @Result(column = "id_no_blind_idx", property = "residentRegistrationNumberBlindIndex"),
+            @Result(column = "phone_blind_idx", property = "phoneBlindIndex")
+    })
+    List<User> search(@Param("name") String name,
+                       @Param("phoneBlindIndex") String phoneBlindIndex,
+                       @Param("rrnBlindIndex") String rrnBlindIndex);
+}
+```
+
+이제 `User.residentRegistrationNumber`/`phone`은 `insert()`와 `findByUserId()` 경로에서는 항상 평문입니다 — Service는 저장 전 암호화, 단건 조회 후 복호화를 신경 쓸 필요가 없습니다. 다만 `search()`처럼 여러 행을 한 번에 다루는 목록 조회는 의도적으로 typeHandler를 걸지 않았다는 점이 핵심입니다(4-3절에서 이어짐).
+
+#### 4-3. Service — 저장/단건 조회/목록 조회를 다르게 다루기
+
+```java
+@RequiredArgsConstructor
+@Service
+public class UserService {
+    private final UserMapper userMapper;
+    private final PasswordService passwordService;
+    private final UserSearchCacheService userSearchCacheService;
+
+    @CacheEvict(value = "userSearchRaw", allEntries = true)
+    @Transactional
+    public Long register(UserRegisterRequestDto dto) {
+        // ... 입력 검증 생략 ...
+
+        // 주민등록번호/전화번호는 평문 그대로 넘긴다 - UserMapper.insert()의 UserPiiTypeHandler가
+        // AES-GCM으로 암호화해 저장한다.
+        User user = User.builder()
+                .userId(dto.getUserId())
+                .password(passwordService.hashUserPassword(dto.getPassword()))
+                .username(dto.getUsername())
+                .residentRegistrationNumber(dto.getResidentRegistrationNumber())
+                .phone(normalizedPhone)
+                .residentRegistrationNumberBlindIndex(passwordService.computeRrnBlindIndex(dto.getResidentRegistrationNumber()))
+                .phoneBlindIndex(passwordService.computePhoneBlindIndex(normalizedPhone))
+                .build();
+
+        userMapper.insert(user);
+        return user.getId();
+    }
+
+    // userMapper.search()는 id_no/phone을 ciphertext 그대로 돌려준다(4-2절 참고) - 여기서 행별로
+    // 개별 복호화를 시도해, 한 행의 ciphertext에 문제가 있어도 그 행만 표시를 대체하고 나머지 행은
+    // 정상적으로 보여준다.
+    public List<UserResponseDto> search(String name, String phone, String residentRegistrationNumber) {
+        String phoneBlindIndex = (phone == null || phone.isEmpty())
+                ? null : passwordService.computePhoneBlindIndex(normalizePhone(phone));
+        String rrnBlindIndex = (residentRegistrationNumber == null || residentRegistrationNumber.isEmpty())
+                ? null : passwordService.computeRrnBlindIndex(residentRegistrationNumber);
+        return userMapper.search(name, phoneBlindIndex, rrnBlindIndex).stream()
+                .map(user -> new UserResponseDto(
+                        user,
+                        passwordService.decryptUserPiiForDisplay(user.getResidentRegistrationNumber()),
+                        passwordService.decryptUserPiiForDisplay(user.getPhone())))
+                .collect(Collectors.toList());
+    }
+}
+```
+
+`decryptUserPiiForDisplay(...)`는 실패해도 예외를 던지지 않고 대체 문자열을 반환하는, 목록 화면 전용 fail-soft 복호화입니다(`PasswordService`):
+
+```java
+public String decryptUserPiiForDisplay(String encryptedText) {
+    if (encryptedText == null || encryptedText.isEmpty()) {
+        return encryptedText;
+    }
+    try {
+        return userPiiCryptoService.decrypt(encryptedText);
+    } catch (RuntimeException e) {
+        logger.warn("Failed to decrypt user-pii value for display: {}", e.getMessage());
+        return "(복호화 실패)"; // 한 행이 깨져도 나머지 행은 정상 표시
+    }
+}
+```
+
+#### 4-4. 주의: 레거시/비정형 데이터가 섞인 컬럼에는 읽기 경로에 TypeHandler를 걸지 말 것
+
+`users`(4-1의 `UserPiiTypeHandler`)와 `board`(`BoardPasswordTypeHandler`)의 차이가 정확히 이 문제를 보여줍니다. `board` 테이블에는 이 라이브러리 도입 이전의 레거시 포맷 비밀번호가 약 4.6만 건 섞여 있어, `@Results`로 읽기 경로에까지 TypeHandler를 걸면 그 데이터를 스치는 **모든** `SELECT`가 `CryptoException`으로 깨집니다. demoApp의 실제 `BoardMapper`는 그래서 쓰기 경로에만 겁니다:
+
+```java
+// password는 쓰기 경로에서만 BoardPasswordTypeHandler를 거친다(암호화) - SELECT는 그대로 암호문을
+// 반환한다(복호화하지 않음). 비밀번호 확인은 PasswordService.validateBoardPassword()가
+// EnvelopeCryptoService.validate() 안에서 명시적으로 처리한다.
+@Insert("insert into board (title, content, author, password, created_date, modified_date) " +
+        "values (#{title}, #{content}, #{author}, " +
+        "#{password,typeHandler=com.xaan.demo.config.mybatis.BoardPasswordTypeHandler}, now(), now())")
+int insert(Board board);
+
+@Select("select id, title, content, author, password, created_date, modified_date from board where id = #{id}")
+Board findById(Long id); // password는 typeHandler 없이 암호문 그대로 반환
+```
+
+`users`처럼 이 라이브러리 도입 시점에 테이블이 초기화되어 레거시 데이터가 없다는 보장이 있을 때만 읽기·쓰기 양쪽에 걸어도 안전합니다. 그런 보장이 없다면 4-3절의 `search()`/`decryptUserPiiForDisplay()`처럼 raw로 읽고 행별로 안전하게 복호화하는 패턴을 쓰세요.
+
+#### 4-5. Redis 캐싱과 self-invocation 함정
+
+demoApp에는 `/users`(캐시 없음)와 동일한 결과를 Redis로 캐싱하는 `/users2`가 있습니다. 처음 구현했을 때는 `UserService` 안에 `@Cacheable` 메서드를 두고 `search()`에서 `this.searchRawCached(...)`처럼 같은 클래스 안에서 직접 호출했는데, **`@Cacheable`은 Spring이 만든 프록시를 거쳐야만 동작하고, 같은 클래스 안에서의 호출(self-invocation)은 그 프록시를 우회**해서 캐싱이 조용히 아예 동작하지 않았습니다(Redis에 아무것도 쌓이지 않았지만 예외도 없어 알아채기 어려웠습니다). 고친 방법은 캐싱 대상 메서드를 별도 빈으로 분리하는 것입니다:
+
+```java
+// UserService에서 분리한 이유: @Cacheable은 Spring 프록시를 거쳐야 동작하는데, 같은 클래스 안에서
+// @Cacheable 메서드를 this로 호출(self-invocation)하면 프록시를 우회해 캐싱이 조용히 동작하지 않는다.
+// 캐싱 메서드를 별도 빈에 두면 UserService가 실제 Spring 관리 참조를 통해 호출하므로 프록시가 개입한다.
+@RequiredArgsConstructor
+@Service
+public class UserSearchCacheService {
+    private final UserMapper userMapper;
+
+    // 캐싱 대상은 반드시 이 raw 조회여야 한다 - userMapper.search()가 id_no/phone을 복호화하지 않고
+    // 그대로 반환하므로, Redis에 저장되는 값도 항상 ciphertext뿐이다(평문 PII가 캐시에 올라가지 않는다).
+    @Cacheable(value = "userSearchRaw", key = "(#name ?: '') + '|' + (#phoneBlindIndex ?: '') + '|' + (#rrnBlindIndex ?: '')")
+    public List<User> search(String name, String phoneBlindIndex, String rrnBlindIndex) {
+        return userMapper.search(name, phoneBlindIndex, rrnBlindIndex);
+    }
+}
+```
+
+```java
+// UserService.searchCached() - userSearchCacheService(별도 빈)를 거쳐야 @Cacheable이 실제로 적용된다.
+public List<UserResponseDto> searchCached(String name, String phone, String residentRegistrationNumber) {
+    String phoneBlindIndex = /* ... 4-3과 동일하게 계산 ... */;
+    String rrnBlindIndex = /* ... */;
+    return userSearchCacheService.search(name, phoneBlindIndex, rrnBlindIndex).stream()
+            .map(user -> new UserResponseDto(
+                    user,
+                    passwordService.decryptUserPiiForDisplay(user.getResidentRegistrationNumber()),
+                    passwordService.decryptUserPiiForDisplay(user.getPhone())))
+            .collect(Collectors.toList());
+}
+```
+
+복호화는 캐시 조회 **이후**에 매번 수행되므로, 캐시 적중 여부와 무관하게 Redis에는 평문 PII가 절대 올라가지 않습니다. 또한 `register()`에는 `@CacheEvict(value = "userSearchRaw", allEntries = true)`가 걸려 있습니다 — 신규 가입자가 어떤 검색 조합에든 걸릴 수 있으므로, 그렇지 않으면 캐시 TTL 동안 방금 가입한 사용자가 `/users2`에서 보이지 않게 됩니다.
+
+이 self-invocation 함정 자체는 MyBatis 고유 문제가 아니라 Spring AOP 프록시의 일반적인 제약입니다 — JPA 프로젝트에서 `@Cacheable`/`@Transactional` 등 프록시 기반 애노테이션을 쓸 때도 동일하게 적용됩니다.
+
+---
+
+### 5. 암호화된 컬럼 검색 — Blind Index (demoApp `users` 테이블 실제 구현)
+
+AES-GCM은 매번 랜덤 IV를 쓰므로 같은 평문도 암호문이 매번 달라집니다 - `WHERE phone = ?`처럼 암호문 컬럼을 직접 검색할 방법이 없다는 뜻입니다. Blind Index는 이 문제를 푸는 표준적인 방법으로, 평문에 대해 **키가 고정된 결정적 HMAC**을 계산해 암호화된 컬럼 옆에 별도 컬럼으로 저장해 두고, 검색할 때는 같은 방식으로 검색어의 HMAC을 계산해 그 컬럼을 `=`로 조회합니다. **정확히 일치하는 경우만** 찾을 수 있고(LIKE 부분 검색 불가), 컬럼 하나당 별도의 키를 씁니다(도메인/DEK와는 무관 - DEK 로테이션이 blind index 값에 영향을 주지 않고, 그 반대도 마찬가지). `BlindIndexService` 빈 구성은 2절의 `CryptoConfig`에 이미 포함되어 있습니다 — JPA/MyBatis 어느 쪽이든 그대로 재사용합니다.
+
+Vault에는 KEK/DEK와 마찬가지로 KV-v2 시크릿 하나에 `key` 필드로 저장합니다(버전 관리는 하지 않음 - blind index 키 교체는 전체 재인덱싱이 필요한 별도 작업이라 KEK/DEK식 점진적 로테이션 대상이 아닙니다):
 
 ```bash
 vault kv put -mount=ebiz_service ebiz_db/blind-index/user-phone \
@@ -572,31 +732,76 @@ vault kv put -mount=ebiz_service ebiz_db/blind-index/user-rrn \
   key="<Base64URL 인코딩된 32바이트 랜덤 키>"
 ```
 
-#### 4-2. 저장 시 — 암호화 값과 blind index를 함께 저장
+#### 5-1. 저장 시 — 암호화 값과 blind index를 함께 저장 (`UserService.register`)
 
 ```java
-@Service
-public class UserService {
-    private final BlindIndexService phoneBlindIndexService;
+User user = User.builder()
+        // ... userId/password/username/phone 등 ...
+        .residentRegistrationNumberBlindIndex(passwordService.computeRrnBlindIndex(residentRegistrationNumber))
+        .phoneBlindIndex(passwordService.computePhoneBlindIndex(normalizedPhone))
+        .build();
+userMapper.insert(user); // id_no_blind_idx/phone_blind_idx는 평문 컬럼, id_no/phone은 typeHandler가 암호화
+```
 
-    public void register(String phone) {
-        user.setPhone(phone);                                          // typeHandler가 암호화해 저장
-        user.setPhoneBlindIndex(phoneBlindIndexService.compute(phone)); // 검색용 HMAC, 평문 컬럼
-        userMapper.insert(user);
+`PasswordService`는 `BlindIndexService`를 그대로 위임할 뿐입니다:
+
+```java
+public String computeRrnBlindIndex(String residentRegistrationNumber) {
+    return rrnBlindIndexService.compute(residentRegistrationNumber);
+}
+
+public String computePhoneBlindIndex(String phone) {
+    return phoneBlindIndexService.compute(phone);
+}
+```
+
+#### 5-2. 검색 시 — 검색어의 blind index로 조회 (`UserService.search`)
+
+```java
+public List<UserResponseDto> search(String name, String phone, String residentRegistrationNumber) {
+    String phoneBlindIndex = (phone == null || phone.isEmpty())
+            ? null : passwordService.computePhoneBlindIndex(normalizePhone(phone));
+    String rrnBlindIndex = (residentRegistrationNumber == null || residentRegistrationNumber.isEmpty())
+            ? null : passwordService.computeRrnBlindIndex(residentRegistrationNumber);
+    return userMapper.search(name, phoneBlindIndex, rrnBlindIndex) /* ... */;
+}
+
+private String normalizePhone(String phone) {
+    return phone.replaceAll("[^0-9]", "");
+}
+```
+
+`normalizePhone(...)`으로 하이픈 등을 제거하는 정규화는 저장 시점(`register`)과 검색 시점(`search`) 모두 **반드시 동일하게** 적용됩니다 — 다르게 정규화하면 같은 번호인데도 blind index가 달라져 조용히 매칭에 실패합니다. `BlindIndexService.compute()` 자체는 정규화를 하지 않으므로, 호출 전 정규화는 항상 호출하는 쪽(`UserService`)의 책임입니다.
+
+#### 5-3. 목록 화면 표시 — 복호화 후 마스킹
+
+검색 결과를 그대로 노출하지 않고, 복호화한 원문을 다시 마스킹해서 보여줍니다(`UserResponseDto` 실제 코드 — 전화번호는 앞 3자리, 주민등록번호는 3~5번째 자리만 남기고 나머지는 `*`):
+
+```java
+public UserResponseDto(User entity, String decryptedResidentRegistrationNumber, String decryptedPhone) {
+    this.id = entity.getId();
+    this.userId = entity.getUserId();
+    this.username = entity.getUsername();
+    this.residentRegistrationNumber = maskResidentRegistrationNumber(decryptedResidentRegistrationNumber);
+    this.phone = maskPhone(decryptedPhone);
+}
+
+private static String maskPhone(String phone) {
+    if (!isAllDigits(phone) || phone.length() <= 3) {
+        return phone; // "(복호화 실패)" 같은 표시 문구는 숫자만이 아니므로 그대로 통과
     }
+    return phone.substring(0, 3) + "*".repeat(phone.length() - 3);
+}
+
+private static String maskResidentRegistrationNumber(String rrn) {
+    if (!isAllDigits(rrn) || rrn.length() < 5) {
+        return rrn;
+    }
+    return "*".repeat(2) + rrn.substring(2, 5) + "*".repeat(rrn.length() - 5);
 }
 ```
 
-#### 4-3. 검색 시 — 검색어의 blind index로 조회
-
-```java
-public List<User> searchByPhone(String phone) {
-    String blindIndex = phoneBlindIndexService.compute(phone);
-    return userMapper.findByPhoneBlindIndex(blindIndex); // WHERE phone_blind_idx = #{blindIndex}
-}
-```
-
-정규화(하이픈 제거 등)는 저장 시점과 검색 시점에 **반드시 동일하게** 적용해야 합니다 - 다르게 정규화하면 같은 번호인데도 blind index가 달라져 조용히 매칭에 실패합니다. `BlindIndexService.compute()`는 정규화를 하지 않으므로, 호출 전에 애플리케이션에서 일관되게 처리해야 합니다.
+즉 하나의 PII 값이 DB에는 암호문(`id_no`/`phone`) + 평문 HMAC(`id_no_blind_idx`/`phone_blind_idx`)로 나뉘어 저장되고, 검색은 HMAC으로, 화면 표시는 "복호화 → 마스킹" 순서로 처리됩니다 — 원문 전체가 화면에 노출되는 지점은 없습니다.
 
 ---
 
@@ -764,7 +969,7 @@ kekVersion(1B) | IV(12B) | Ciphertext(32 bytes, DEK 자체) | GCM Auth Tag(16 by
 | 상속 | `org.apache.ibatis.type.BaseTypeHandler<String>` (`mybatis` 의존성은 `compileOnly` - MyBatis 미사용 프로젝트엔 강제되지 않음) |
 | 사용법 | 도메인별 `EnvelopeCryptoService`를 주입받는 서브클래스를 만들어 Mapper의 `#{prop,typeHandler=...}`/`@Result(typeHandler=...)`에서 참조 |
 | 동작 | `setParameter`에서 `encrypt()`, `getResult`에서 `decrypt()` - `null`/빈 문자열은 그대로 통과 |
-| 주의 | 레거시/비정형 데이터가 섞인 컬럼의 읽기 경로에 걸면 그 데이터를 스치는 모든 `SELECT`가 `CryptoException`으로 깨짐 - [3. MyBatis 프로젝트에서 최소 변경으로 통합](#3-mybatis-프로젝트에서-최소-변경으로-통합--envelopecryptotypehandler) 참고 |
+| 주의 | 레거시/비정형 데이터가 섞인 컬럼의 읽기 경로에 걸면 그 데이터를 스치는 모든 `SELECT`가 `CryptoException`으로 깨짐 - [4-4. 주의: 레거시/비정형 데이터가 섞인 컬럼에는 읽기 경로에 TypeHandler를 걸지 말 것](#4-4-주의-레거시비정형-데이터가-섞인-컬럼에는-읽기-경로에-typehandler를-걸지-말-것) 참고 |
 
 ### 예외 클래스
 
