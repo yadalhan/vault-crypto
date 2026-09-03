@@ -68,7 +68,7 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-actuator'
 
     // vault-crypto: KEK-DEK 봉투 암호화 + BCrypt + Blind Index - 암호/PII 크립토 로직은 전부 여기서 온다
-    implementation 'com.xaan:vault-crypto:0.0.10'
+    implementation 'com.xaan:vault-crypto:0.0.11'
 
     implementation 'org.springframework.boot:spring-boot-starter-data-redis'
 

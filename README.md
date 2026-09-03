@@ -78,7 +78,7 @@ vault-crypto/
 
 | 항목 | 버전 |
 |------|------|
-| Java | 17 이상 |
+| Java | 21 이상 |
 | Spring Cloud Vault | 3.x |
 | HashiCorp Vault | kv-v2 백엔드 |
 | Gradle | 8.x |
@@ -88,7 +88,7 @@ vault-crypto/
 ### Windows
 
 ```bat
-set JAVA_HOME=C:\SW\jdk-17.0.15
+set JAVA_HOME=C:\SW\jdk-21.0.8
 set PATH=%JAVA_HOME%\bin;C:\SW\gradle-8.14.5\bin;%PATH%
 
 gradle.bat clean build publishToMavenLocal
@@ -97,13 +97,13 @@ gradle.bat clean build publishToMavenLocal
 ### Linux
 
 ```bash
-export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
 export PATH=$JAVA_HOME/bin:$PATH
 
 ./gradlew clean build publishToMavenLocal
 ```
 
-빌드된 JAR는 `~/.m2/repository/com/xaan/vault-crypto/0.0.10/`에 설치됩니다.
+빌드된 JAR는 `~/.m2/repository/com/xaan/vault-crypto/0.0.11/`에 설치됩니다.
 
 ## 의존성 추가
 
@@ -126,7 +126,7 @@ repositories {
 
 dependencies {
     // vault-crypto 라이브러리
-    implementation 'com.xaan:vault-crypto:0.0.10'
+    implementation 'com.xaan:vault-crypto:0.0.11'
 
     // Spring Cloud Vault (필수 의존성)
     implementation 'org.springframework.cloud:spring-cloud-starter-vault-config'
@@ -145,7 +145,7 @@ dependencyManagement {
 <dependency>
     <groupId>com.xaan</groupId>
     <artifactId>vault-crypto</artifactId>
-    <version>0.0.10</version>
+    <version>0.0.11</version>
 </dependency>
 ```
 
@@ -1039,6 +1039,10 @@ CryptoException: Envelope domain mismatch: expected ... but got ...
 - 암호문이 이 라이브러리의 봉투 포맷이 아님(예: 다른 방식으로 암호화된 값)
 
 ## Release History
+
+### v0.0.11 (2026-09-03)
+
+**JDK 21 upgrade.** `sourceCompatibility`/`targetCompatibility` bumped `17 → 21`. No API or behavior changes - pure build-target bump, published to `mavenLocal` and picked up by demoApp (bumped to match).
 
 ### v0.0.10 (2026-08-29) — critical fix for v0.0.9
 
